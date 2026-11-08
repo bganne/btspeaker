@@ -353,8 +353,31 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// writeErr reports err to the client. 5xx details (device paths, syscall errors) stay
+// in the log; 4xx texts describe the caller's own mistake and are returned as is.
 func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	msg := err.Error()
+	if code >= 500 {
+		slog.Error("web: api action failed", "err", err)
+		msg = "action failed"
+	}
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// writeActionErr answers a failed device action: unknown device is 404, a
+// device that is not connected 409 (client errors, not logged as failures),
+// anything else 500.
+func writeActionErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, mgmt.ErrUnknownDevice):
+		slog.Info("web: api action rejected", "err", err)
+		writeErr(w, http.StatusNotFound, err)
+	case errors.Is(err, mgmt.ErrNotConnected):
+		slog.Info("web: api action rejected", "err", err)
+		writeErr(w, http.StatusConflict, err)
+	default:
+		writeErr(w, http.StatusInternalServerError, err)
+	}
 }
 
 func ok(w http.ResponseWriter) { writeJSON(w, http.StatusOK, map[string]bool{"ok": true}) }
@@ -362,9 +385,11 @@ func ok(w http.ResponseWriter) { writeJSON(w, http.StatusOK, map[string]bool{"ok
 // Errors from UI actions reach the page only as one of these codes (?msg=code), never as
 // free text, so a crafted link cannot show attacker-chosen wording.
 var flashMessages = map[string]string{
-	"bad_addr":     "Invalid device address.",
-	"invalid_name": "Invalid name (1..248 bytes, no control or bidi format characters).",
-	"failed":       "The action failed; see the service log.",
+	"bad_addr":      "Invalid device address.",
+	"unknown":       "Unknown device.",
+	"not_connected": "The device is not connected.",
+	"invalid_name":  "Invalid name (1..248 bytes, no control or bidi format characters).",
+	"failed":        "The action failed; see the service log.",
 }
 
 var (
@@ -379,6 +404,10 @@ func flashCode(err error) string {
 		return "bad_addr"
 	case errors.Is(err, errInvalidName):
 		return "invalid_name"
+	case errors.Is(err, mgmt.ErrUnknownDevice):
+		return "unknown"
+	case errors.Is(err, mgmt.ErrNotConnected):
+		return "not_connected"
 	}
 	return "failed"
 }
@@ -440,11 +469,19 @@ func (s *server) status(w http.ResponseWriter, r *http.Request) {
 
 // decode reads an optional small JSON body into v. An empty body is fine.
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
-	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(v)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(v)
 	if errors.Is(err, io.EOF) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected data after JSON body")
+	}
+	return nil
 }
 
 func (s *server) openPairing(w http.ResponseWriter, r *http.Request) {
@@ -481,7 +518,7 @@ func (s *server) disconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.b.Disconnect(addr); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeActionErr(w, err)
 		return
 	}
 	ok(w)
@@ -494,7 +531,7 @@ func (s *server) forget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.b.Forget(addr); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeActionErr(w, err)
 		return
 	}
 	ok(w)

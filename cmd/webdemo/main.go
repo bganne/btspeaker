@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"btspeaker/internal/bt"
+	"btspeaker/internal/mgmt"
 	"btspeaker/internal/web"
 )
 
@@ -100,7 +101,7 @@ func (f *fake) Disconnect(a bt.Addr) error {
 	return f.act(func() error {
 		d, ok := f.devices[a.String()]
 		if !ok || !d.connected {
-			return errors.New("not connected")
+			return mgmt.ErrNotConnected
 		}
 		d.connected, d.lastSeen = false, time.Now()
 		if f.streaming == a.String() {
@@ -114,7 +115,7 @@ func (f *fake) Forget(a bt.Addr) error {
 	return f.act(func() error {
 		s := a.String()
 		if _, ok := f.devices[s]; !ok {
-			return errors.New("unknown device")
+			return mgmt.ErrUnknownDevice
 		}
 		delete(f.devices, s)
 		for i, x := range f.order {
