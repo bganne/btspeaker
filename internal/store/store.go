@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"btspeaker/internal/bt"
 )
 
@@ -421,7 +423,9 @@ func (s *Store) writeFile(b []byte, g uint64, saved map[string]time.Time) error 
 		return nil
 	}
 	tmp := s.path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// A stale tmp could keep a loose mode or be a planted symlink: start fresh.
+	os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}

@@ -146,8 +146,43 @@ func TestTouchBackwardClockSaves(t *testing.T) {
 // breakSave makes saveLocked fail even as root: the temp file path is a directory.
 func breakSave(t *testing.T, dir string) {
 	t.Helper()
-	if err := os.Mkdir(filepath.Join(dir, "state.json.tmp"), 0o700); err != nil {
+	tmp := filepath.Join(dir, "state.json.tmp")
+	if err := os.Mkdir(tmp, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	// Non-empty: writeFile removes a stale tmp first, which must not clear it.
+	if err := os.WriteFile(filepath.Join(tmp, "x"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleTmpModeAndSymlink(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, "state.json.tmp")
+	if err := os.WriteFile(tmp, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := bt.Addr{1, 2, 3, 4, 5, 6}
+	if err := s.PutKeyNamed(a, NewLinkKey(8, [16]byte{1}, 0), "P", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "state.json")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("state.json mode %v, err %v; want 0600", fi.Mode(), err)
+	}
+	// A planted symlink is replaced, not followed.
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.Symlink(victim, tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Touch(a, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(victim); err == nil {
+		t.Fatal("symlink target was written")
 	}
 }
 
