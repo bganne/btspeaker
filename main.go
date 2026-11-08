@@ -56,9 +56,10 @@ func envName(flagName string) string {
 }
 
 // applyEnv sets every flag not given on the command line from its environment variable.
-func applyEnv(fs *flag.FlagSet, getenv func(string) (string, bool)) error {
-	set := map[string]bool{}
+// It adds the names of the flags it set to set, which also holds the command-line flags.
+func applyEnv(fs *flag.FlagSet, getenv func(string) (string, bool), set map[string]bool) error {
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	var fromEnv []string
 	var err error
 	fs.VisitAll(func(f *flag.Flag) {
 		if set[f.Name] || err != nil {
@@ -72,8 +73,12 @@ func applyEnv(fs *flag.FlagSet, getenv func(string) (string, bool)) error {
 			if e := f.Value.Set(v); e != nil {
 				err = fmt.Errorf("%s: %w", envName(f.Name), e)
 			}
+			fromEnv = append(fromEnv, f.Name)
 		}
 	})
+	for _, n := range fromEnv {
+		set[n] = true
+	}
 	return err
 }
 
@@ -101,7 +106,8 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	if err := applyEnv(fs, getenv); err != nil {
+	explicit := map[string]bool{} // set on the command line or from the environment
+	if err := applyEnv(fs, getenv, explicit); err != nil {
 		return nil, err
 	}
 	if o.volume != "software" && o.volume != "off" {
@@ -117,13 +123,7 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 		return nil, fmt.Errorf("-spdif-preroll must be 0..1s, got %v", o.spdifPreroll)
 	}
 	if o.spdifPreroll > o.buffer {
-		explicit := false
-		fs.Visit(func(f *flag.Flag) {
-			if f.Name == "spdif-preroll" {
-				explicit = true
-			}
-		})
-		if explicit {
+		if explicit["spdif-preroll"] {
 			return nil, fmt.Errorf("-spdif-preroll (%v) must not exceed -buffer (%v)", o.spdifPreroll, o.buffer)
 		}
 		o.spdifPreroll = o.buffer // the default must not make a small -buffer fatal
@@ -309,7 +309,10 @@ func run(o *options) error {
 	slog.Info("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	httpSrv.Shutdown(sctx)
+	if err := httpSrv.Shutdown(sctx); err != nil {
+		slog.Warn("http shutdown", "err", err)
+		httpSrv.Close()
+	}
 	ctrl.Shutdown() // discoverable off
 	closeAll()
 	// Bounded: a stuck goroutine must not make systemd wait TimeoutStopSec (90 s).
@@ -459,7 +462,10 @@ func reprobeRates(ctx context.Context, dev string, interval time.Duration, probe
 	}
 }
 
-// connLimitListener blocks in Accept while max connections are open.
+// connLimitListener blocks in Accept while max connections are open. The slot is taken
+// before the blocking Listener.Accept and becomes that connection's slot when one
+// arrives, so the cap is exactly max (not max-1); the pending Accept merely reserves
+// the next slot.
 type connLimitListener struct {
 	net.Listener
 	sem   chan struct{}

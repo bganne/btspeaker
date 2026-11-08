@@ -82,6 +82,15 @@ func TestPrerollClampedToSmallBuffer(t *testing.T) {
 	if _, err := parseOptions([]string{"-buffer", "100ms", "-spdif-preroll", "200ms"}, noEnv); err == nil {
 		t.Error("explicit preroll > buffer accepted")
 	}
+	env := func(k string) (string, bool) {
+		if k == "BTSPEAKER_SPDIF_PREROLL" {
+			return "500ms", true
+		}
+		return "", false
+	}
+	if o, err := parseOptions(nil, env); err == nil {
+		t.Errorf("env preroll > buffer accepted (preroll %v)", o.spdifPreroll)
+	}
 }
 
 func TestInvalidDefaultNameFallsBack(t *testing.T) {
