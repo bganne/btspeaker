@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -103,7 +104,12 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 	fs.StringVar(&o.httpHosts, "http-hosts", "", "comma-separated hostnames accepted in the HTTP Host header (default: hostname, FQDN, hostname.local, localhost; IP literals always accepted)")
 	fs.BoolVar(&o.listDevices, "list-devices", false, "print ALSA playback devices and exit")
 	fs.BoolVar(&o.testTone, "test-tone", false, "play a 2 s test tone on -alsa-device and exit")
+	fs.SetOutput(io.Discard) // main prints a parse error once; usage only for -h
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fs.SetOutput(os.Stderr)
+			fs.Usage()
+		}
 		return nil, err
 	}
 	explicit := map[string]bool{} // set on the command line or from the environment
@@ -328,13 +334,13 @@ func run(o *options) error {
 
 const shutdownWait = 5 * time.Second
 
-// defaultName is the host's FQDN; a variable for tests.
-var defaultName = func() string {
+// defaultName is the host's FQDN, computed once; a variable for tests.
+var defaultName = sync.OnceValue(func() string {
 	h, _ := os.Hostname()
 	hosts, _ := os.ReadFile("/etc/hosts")
 	resolv, _ := os.ReadFile("/etc/resolv.conf")
 	return fqdn(h, string(hosts), string(resolv))
-}
+})
 
 // fqdn qualifies host like hostname -f on Debian, but without DNS (the network
 // may not be up at boot): the name /etc/hosts gives it, else host plus the
@@ -589,16 +595,21 @@ func (g *admitGate) accepted(psm uint16, a bt.Addr) {
 }
 
 func acceptLoop(l *hci.Listener, handle func(bt.Conn), lim *limiter, gate *admitGate) {
+	var errLogged time.Time // a persistent error (EMFILE) logs once a minute, not every retry
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			slog.Error("accept", "psm", l.PSM(), "err", err)
+			if time.Since(errLogged) >= time.Minute {
+				errLogged = time.Now()
+				slog.Error("accept", "psm", l.PSM(), "err", err)
+			}
 			time.Sleep(time.Second)
 			continue
 		}
+		errLogged = time.Time{}
 		peer := c.RemoteAddr()
 		if !gate.allow(l.PSM(), peer) {
 			c.Close()
