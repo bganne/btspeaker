@@ -34,7 +34,7 @@ also running mpd).
 - Build host: `go build .` · cubox: `make arm` (CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7)
 - `make bench-arm`: armv7 test binaries in `bench-arm/` (sbc.test, player.test); run on cubox with `-test.bench=.`
 - Vet for arm too: `GOARCH=arm go vet ./...`
-- Fuzz: `go test -run=^$ -fuzz=FuzzDecode -fuzztime=60s ./internal/sbc` (also `FuzzSignal`, `FuzzRTP` in `./internal/avdtp`; `FuzzSDP` in `./internal/sdp`; `FuzzAVRCP` in `./internal/avrcp`)
+- Fuzz: `go test -run=^$ -fuzz=FuzzDecode -fuzztime=60s ./internal/sbc` (also `FuzzSignal`, `FuzzRTP`, `FuzzStream` in `./internal/avdtp`; `FuzzSDP` in `./internal/sdp`; `FuzzAVRCP` in `./internal/avrcp`)
 - Laptop E2E: CSR dongle is hci1; needs `sudo systemctl stop bluetooth` first;
   `sudo ./btspeaker -adapter hci1 -alsa-device hw:0,0`; debug with `sudo btmon`.
 - Web UI without BT: `go run ./cmd/webdemo` → http://localhost:8099 (`-fail` makes actions error, `-http-password`).

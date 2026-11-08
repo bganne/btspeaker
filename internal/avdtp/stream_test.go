@@ -114,3 +114,77 @@ func TestStreamOnPacketAllocFree(t *testing.T) {
 		t.Fatalf("onPacket allocates: %v per packet", a)
 	}
 }
+
+// recSink records the size of the largest Write.
+type recSink struct {
+	fakeSink
+	max int
+}
+
+func (r *recSink) Write(p []int16) {
+	r.mu.Lock()
+	r.max = max(r.max, len(p))
+	r.mu.Unlock()
+	r.fakeSink.Write(p)
+}
+
+func newRecStream(sink *recSink) *stream {
+	s := newTestServer(sink)
+	c := newConn(1)
+	d := &device{st: stStreaming, sinkOn: true, media: c, gen: 1}
+	s.owner = d
+	st := newStream(s, d, c, &stepDec{})
+	st.begin(sbcConfig{rate: 44100, mode: modeStereo, blocks: 16, subbands: 8}, 1)
+	return st
+}
+
+func TestStreamWriteChunksBounded(t *testing.T) {
+	sink := &recSink{}
+	st := newRecStream(sink)
+	st.onPacket(1, 0, 7, goodPayload)
+	// 15 frames after a ~90 ms timeline gap: fill plus audio far exceeds one chunk.
+	pl := []byte{15}
+	for i := 0; i < 15; i++ {
+		pl = append(pl, 1, 1, 1, 1)
+	}
+	st.onPacket(3, 4000, 7, pl)
+	_, total := sink.get()
+	if total <= 2*maxSinkFrames*2 {
+		t.Fatalf("test did not exercise a large write: %d samples", total)
+	}
+	if sink.max > maxSinkFrames*2 {
+		t.Fatalf("Write of %d samples exceeds %d", sink.max, maxSinkFrames*2)
+	}
+}
+
+// FuzzStream drives the stream state machine with arbitrary packet tuples.
+func FuzzStream(f *testing.F) {
+	f.Add([]byte{0, 1, 0, 0, 0, 7, 5, 1, 1, 1, 1, 1})
+	f.Add([]byte{0, 4, 0, 0, 128, 7, 5, 1, 1, 1, 1, 1})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		sink := &recSink{}
+		st := newRecStream(sink)
+		// Records: seq(2) ts(3) ssrc(1) len(1) payload(len%24).
+		for len(b) >= 7 {
+			seq := uint16(b[0])<<8 | uint16(b[1])
+			ts := uint32(b[2])<<16 | uint32(b[3])<<8 | uint32(b[4])
+			if b[2]&0x80 != 0 {
+				ts |= 0xFF000000
+			}
+			ssrc := uint32(b[5])
+			n := min(int(b[6])%24, len(b)-7)
+			p := b[7 : 7+n]
+			b = b[7+n:]
+			if len(p) < 1 || p[0]&0x80 != 0 {
+				continue
+			}
+			st.onPacket(seq, ts, ssrc, p)
+			if sink.max > maxSinkFrames*2 {
+				t.Fatalf("Write of %d samples", sink.max)
+			}
+			if len(st.out) > outCap*4 {
+				t.Fatalf("out grew to %d", len(st.out))
+			}
+		}
+	})
+}

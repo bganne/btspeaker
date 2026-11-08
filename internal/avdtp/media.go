@@ -26,6 +26,10 @@ const maxTSOnlyGaps = 8
 // RTP off a non-sample clock never has such a run, so it gets no silence at all.
 const minTSCleanPackets = 16
 
+// maxSinkFrames is the most sample frames (per channel) passed in one sink
+// Write: 15 SBC frames of 16 blocks x 8 subbands, as the player assumes.
+const maxSinkFrames = 15 * 128
+
 // conceal appends n frames of faded silence to out and accounts them as concealed audio.
 func (s *Server) conceal(cc *concealer, out []int16, n, rate int) []int16 {
 	out = cc.silence(out, n)
@@ -323,7 +327,14 @@ func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
 		ok := d.sinkOn && d.gen == g && d.st == stStreaming && d.media == c
 		s.mu.Unlock()
 		if ok {
-			s.sink.Write(out)
+			// Bounded chunks: the player sizes its buffer pool for at most
+			// maxSinkFrames per Write, concealment fill must not exceed it.
+			step := maxSinkFrames * ch
+			for p := out; len(p) > 0; {
+				n := min(len(p), step)
+				s.sink.Write(p[:n])
+				p = p[n:]
+			}
 		}
 		s.sinkMu.Unlock()
 	}
