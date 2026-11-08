@@ -1,7 +1,6 @@
 [Unit]
 Description=Bluetooth A2DP speaker (btspeaker)
-After=network-online.target sound.target
-Wants=network-online.target
+After=network.target sound.target
 Conflicts=bluetooth.service
 # Never give up restarting (a peer that keeps crashing us must not stop the service for good).
 StartLimitIntervalSec=0

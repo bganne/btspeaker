@@ -8,7 +8,7 @@ GOARM ?= 7
 arm:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=$(GOARM) go build -trimpath -ldflags='-s -w' -o btspeaker-armv7 .
 
-test:
+test: vet
 	go test ./...
 
 vet:
