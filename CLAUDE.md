@@ -26,6 +26,8 @@ also running mpd).
 
 ## Git
 - Commit directly on `master` (no feature branches), except in worktrees.
+- One commit per area (package), subject `pkg: what changed`, body explaining what/why. Never
+  mention reviews (no "review fixes", no review ids); review reports/decisions (`docs/history/`, `docs/review-decisions.md`) stay uncommitted.
 
 ## Commands
 - Test: `go vet ./... && go test ./...`
