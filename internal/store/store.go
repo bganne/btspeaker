@@ -357,6 +357,12 @@ func (s *Store) Remove(addr bt.Addr) error {
 	removed := s.st.Devices[i]
 	s.st.Devices = append(s.st.Devices[:i:i], s.st.Devices[i+1:]...)
 	_, err := s.saveGenLocked()
+	if err != nil {
+		// A concurrent save marshalled while s.mu was released also lacks the
+		// device and may still succeed: retry once so disk catches up with
+		// memory rather than rolling back underneath it.
+		_, err = s.saveGenLocked()
+	}
 	if err != nil && s.find(addr, false) < 0 {
 		// Undo just this removal (not a gen-based snapshot restore, which a
 		// concurrent Touch would defeat): memory must not get ahead of disk.
