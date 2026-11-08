@@ -452,6 +452,9 @@ type PCM struct {
 
 var errAborted = errors.New("alsa: aborted")
 
+// MaxPeriod caps the negotiated period: a blocking Write can wait this long.
+const MaxPeriod = 50 * time.Millisecond // = default 200 ms buffer / 4
+
 // MSBits returns the number of significant bits per sample the driver reported after
 // HW_PARAMS, or 0 if unknown.
 func (p *PCM) MSBits() int { return p.msbits }
@@ -499,7 +502,7 @@ func configure(fd, rate, channels int, f Format, bufferFrames int) (*PCM, error)
 	if err := refine(fd, &h); err != nil {
 		return nil, fmt.Errorf("alsa: %d Hz %d ch %v not supported: %w", rate, channels, f, err)
 	}
-	// Buffer near the target, then period ~ buffer/4; each step falls back to the
+	// Buffer near the target, then period ~ min(buffer/4, MaxPeriod); each step falls back to the
 	// unrestricted range if the exact value cannot be satisfied.
 	narrow := func(param int, target uint32) {
 		iv := h.ivl(param)
@@ -510,7 +513,12 @@ func configure(fd, rate, channels int, f Format, bufferFrames int) (*PCM, error)
 		}
 	}
 	narrow(paramBufferSz, uint32(bufferFrames))
-	narrow(paramPeriodSz, h.ivl(paramBufferSz).max/4)
+	// From the target, not the interval: if narrowing failed, its max may be far larger.
+	b := h.ivl(paramBufferSz)
+	// A blocking write waits up to a period for space, and the caller queues
+	// audio meanwhile (the player drops past 100 ms), so cap the period at
+	// MaxPeriod: large buffers get more periods, not longer ones.
+	narrow(paramPeriodSz, min(clamp(uint32(bufferFrames), b.min, b.max)/4, uint32(int64(rate)*int64(MaxPeriod)/int64(time.Second))))
 	h.rmask = ^uint32(0) // refine cleared it; like alsa-lib, ask HW_PARAMS to refine everything
 	if err := ioctl(fd, ioctlHWParams, unsafe.Pointer(&h)); err != nil {
 		return nil, fmt.Errorf("alsa: HW_PARAMS: %w", err)

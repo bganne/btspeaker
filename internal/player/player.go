@@ -76,7 +76,7 @@ func (alsaBackend) Open(dev string, rate, ch int, f alsa.Format, n int) (PCM, er
 const (
 	defaultVolume  = 100                    // ≈ -10.6 dB until the remote sends SetAbsoluteVolume
 	queueChunks    = 64                     // channel capacity; the real bound is maxQueue of audio
-	maxQueue       = 100 * time.Millisecond // queued audio before the oldest chunks are dropped
+	maxQueue       = 100 * time.Millisecond // queued audio before the oldest chunks are dropped; > alsa.MaxPeriod (a write blocks up to a period)
 	freeChunks     = 32                     // recycled byte buffers
 	busyMessage    = "ALSA device busy (mpd playing?)"
 	maxVolumeDB    = 0.0
