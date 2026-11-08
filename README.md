@@ -53,7 +53,7 @@ below 0x1001: SDP, AVCTP, AVDTP). State (link keys, names) is in
 | `-name` | host's FQDN | speaker name (default: hostname qualified from `/etc/hosts` or the resolv.conf domain/search, no DNS); a name set via the UI/API is persisted and wins |
 | `-alsa-device` | `hw:0,0` | `hw:CARD,DEV` only (no plug/dmix) |
 | `-buffer` | `200ms` | ALSA buffer, `20ms`..`2s` |
-| `-idle-release` | `5s` | release the device after this much digital silence |
+| `-idle-release` | `5s` | release the device after this much digital silence; must be > 0 |
 | `-spdif-preroll` | `200ms` | zeros played after each (re)open so an S/PDIF receiver can relock before audio starts; `0` = off; must not exceed `-buffer` |
 | `-pairing-timeout` | `1m` | default pairing window |
 | `-always-pairable` | off | permanently discoverable and accepting pairing: open Just Works pairing, anyone in range can pair (insecure) |
@@ -62,8 +62,8 @@ below 0x1001: SDP, AVCTP, AVDTP). State (link keys, names) is in
 | `-volume` | `software` | `software` applies AVRCP volume as gain, `off` is bit-perfect |
 | `-state-dir` | `/var/lib/btspeaker` | |
 | `-listen` | `:8099` | web UI / API |
-| `-http-user`, `-http-password` | `admin`, none | basic auth on every route when a password is set |
-| `-http-hosts` | `localhost`, hostname, its FQDN (the default `-name`), `hostname.local` | allowed `Host` names (IP literals always allowed; blocks DNS rebinding) |
+| `-http-user`, `-http-password` | `admin`, none | basic auth on every route when a password is set; after repeated failures (burst 10, then 5/s) a client gets `429` |
+| `-http-hosts` | `localhost`, hostname, its FQDN (the default `-name`), `hostname.local` | allowed `Host` names (IP literals always allowed; blocks DNS rebinding); other hosts get `421` |
 | `-list-devices`, `-test-tone` | | print ALSA playback devices / play a 2 s tone, then exit |
 
 Basic auth is cleartext on plain HTTP: if that matters, use `-listen <LAN IP>` or a TLS proxy.
@@ -95,7 +95,7 @@ bondable until the next start.
 |---|---|---|
 | GET | `/` | UI |
 | GET | `/api/status` | adapter, pairing window, devices (connected, last seen), stream, volume, last error, `volume_ignored`, `diagnostics` |
-| POST / DELETE | `/api/pairing` `{"seconds":120}` | open (body optional) / close the pairing window |
+| POST / DELETE | `/api/pairing` `{"seconds":120}` | open (body optional; `seconds` 0..3600, 0 = `-pairing-timeout`) / close the pairing window |
 | POST | `/api/devices/{addr}/disconnect` | disconnect a device |
 | DELETE | `/api/devices/{addr}` | unpair and forget a device |
 | POST | `/api/name` `{"name":"..."}` | rename the speaker |
@@ -103,6 +103,8 @@ bondable until the next start.
 ```sh
 curl -u admin:pw -X POST -d '{"seconds":60}' http://cubox:8099/api/pairing
 ```
+
+JSON bodies with unknown fields are rejected with `400`.
 
 `/api/status` extras:
 - `volume_ignored` (omitted when false): `true` with `-volume off` (bit-perfect output); `volume` is
