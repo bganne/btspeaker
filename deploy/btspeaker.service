@@ -11,7 +11,8 @@ ExecStart=/usr/local/bin/btspeaker
 EnvironmentFile=-/etc/default/btspeaker
 Restart=on-failure
 RestartSec=3
-RestartPreventExitStatus=3
+# 2: bad flag/env value, 3: bluetoothd running. Restarting cannot fix either.
+RestartPreventExitStatus=2 3
 
 # DynamicUser also implies ProtectSystem=strict, PrivateTmp, NoNewPrivileges,
 # RestrictSUIDSGID and RemoveIPC.

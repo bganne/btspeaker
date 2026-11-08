@@ -172,12 +172,12 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "btspeaker:", err)
-		os.Exit(2)
+		os.Exit(2) // the unit's RestartPreventExitStatus: a config error does not fix itself
 	}
 	if err := run(o); err != nil {
 		slog.Error("fatal", "err", err)
 		if errors.Is(err, errBluetoothd) {
-			os.Exit(3) // the unit's RestartPreventExitStatus=3: do not restart-loop
+			os.Exit(3) // the unit's RestartPreventExitStatus: do not restart-loop
 		}
 		os.Exit(1)
 	}
@@ -309,11 +309,11 @@ func run(o *options) error {
 	slog.Info("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	ctrl.Shutdown() // discoverable off first: the HTTP shutdown can take up to 2 s
 	if err := httpSrv.Shutdown(sctx); err != nil {
 		slog.Warn("http shutdown", "err", err)
 		httpSrv.Close()
 	}
-	ctrl.Shutdown() // discoverable off
 	closeAll()
 	// Bounded: a stuck goroutine must not make systemd wait TimeoutStopSec (90 s).
 	done := make(chan struct{})
