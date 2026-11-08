@@ -102,9 +102,9 @@ func next(r *uint32) uint32 {
 
 // tpdf returns triangular noise of +-1 LSB (scaled for Q15: +-1<<15) as the sum of
 // two 15-bit uniforms taken from the high and the middle bits of one draw.
-func tpdf(r *uint32) int64 {
+func tpdf(r *uint32) int32 {
 	x := next(r)
-	return int64(x>>17) + int64((x>>2)&0x7FFF) - 32767
+	return int32(x>>17) + int32((x>>2)&0x7FFF) - 32767
 }
 
 // scale16 applies gain with rounding (and dither if rng != nil) to one S16 sample.
@@ -113,7 +113,7 @@ func scale16(s int16, gain int32, rng *uint32) int16 {
 		return int16(clip16((int32(s)*gain + unity/2) >> 15))
 	}
 	// int32 suffices: |s*gain| <= 2^30 (gain <= unity), rounding 2^14, dither < 2^15.
-	v := (int32(s)*gain + unity/2 + int32(tpdf(rng))) >> 15
+	v := (int32(s)*gain + unity/2 + tpdf(rng)) >> 15
 	return int16(clip16(v))
 }
 
@@ -134,8 +134,8 @@ func convertFlat(dst []byte, pcm []int16, f alsa.Format, gain int32, rng *uint32
 	case alsa.S24LE:
 		dst = dst[:4*len(pcm)]
 		for i, s := range pcm {
-			v := (int32(s) * gain) >> 7 // s<<8 * gain>>15
-			binary.LittleEndian.PutUint32(dst[4*i:], uint32(clip(int64(v), 1<<23)))
+			v := (int32(s) * gain) >> 7 // s<<8 * gain>>15; gain <= unity so |v| <= 1<<23, no clip needed
+			binary.LittleEndian.PutUint32(dst[4*i:], uint32(v))
 		}
 	default: // S32LE
 		dst = dst[:4*len(pcm)]
@@ -163,7 +163,7 @@ func convertDup(dst []byte, pcm []int16, f alsa.Format, gain int32, rng *uint32)
 	case alsa.S24LE:
 		dst = dst[:8*len(pcm)]
 		for i, s := range pcm {
-			v := uint32(clip(int64((int32(s)*gain)>>7), 1<<23))
+			v := uint32((int32(s) * gain) >> 7)
 			binary.LittleEndian.PutUint32(dst[8*i:], v)
 			binary.LittleEndian.PutUint32(dst[8*i+4:], v)
 		}
@@ -185,17 +185,6 @@ func clip16(v int32) int32 {
 		return math.MinInt16
 	}
 	return v
-}
-
-// clip limits v to the signed range [-lim, lim-1].
-func clip(v, lim int64) int32 {
-	if v >= lim {
-		v = lim - 1
-	}
-	if v < -lim {
-		v = -lim
-	}
-	return int32(v)
 }
 
 // TestTone plays a 1 kHz sine at -12 dBFS for d on dev (44100 Hz if supported, else
