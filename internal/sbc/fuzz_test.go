@@ -21,6 +21,19 @@ func FuzzDecode(f *testing.F) {
 		f.Add(data)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
+		fuzzDecode(t, data)
+		// The CRC check rejects ~255/256 mutated frames before bit allocation
+		// and synthesis; also decode with a valid CRC patched in.
+		if fi, ok := parseHeader(data); ok && len(data) >= fi.FrameLen {
+			b := append([]byte(nil), data...)
+			b[3] = crc8(&fi, b)
+			fuzzDecode(t, b)
+		}
+	})
+}
+
+func fuzzDecode(t *testing.T, data []byte) {
+	{
 		d := NewDecoder()
 		pcm := make([]int16, 256)
 		for len(data) > 0 {
@@ -42,5 +55,5 @@ func FuzzDecode(f *testing.F) {
 			}
 			data = data[c:]
 		}
-	})
+	}
 }
