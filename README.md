@@ -81,6 +81,10 @@ Works pairing for a speaker with no display or buttons): outside the window the 
 bondable, a link key from an unknown device is discarded and revoked, and AVDTP/AVRCP connections
 from unpaired devices are refused. SDP stays open to everyone.
 
+On shutdown btspeaker turns discoverable and bondable off. If that cannot complete (the process is
+killed, or an adapter init holds things up for more than 2 s), the adapter can stay discoverable and
+bondable until the next start.
+
 ## HTTP API
 
 | Method | Path | |
