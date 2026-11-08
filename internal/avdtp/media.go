@@ -36,7 +36,6 @@ func (s *Server) conceal(cc *concealer, out []int16, n, rate int) []int16 {
 // mediaLoop reads RTP/SBC packets from the media channel of d until it closes.
 func (s *Server) mediaLoop(d *device, c bt.Conn) {
 	dec := s.newDecoder()
-	gen := -1
 	defer func() {
 		s.mu.Lock()
 		owns := d.media == c
@@ -66,18 +65,7 @@ func (s *Server) mediaLoop(d *device, c bt.Conn) {
 		n = 672
 	}
 	buf := make([]byte, n)
-	var pcm [256]int16
-	// Room for 15 decoded frames plus up to 100 ms of concealment; reused,
-	// sink.Write doesn't retain.
-	out := make([]int16, 0, 16*256+2*4800)
-	var cc concealer
-	var budget concealBudget
-	dups := 0    // consecutive duplicate/reordered drops
-	tsOnly := 0  // consecutive timestamp-only gaps; sticks at maxTSOnlyGaps until a stream reset
-	tsClean := 0 // consecutive packets whose timestamp matched the decoded timeline
-	warned := false
-	var ssrc uint32
-	haveSSRC := false
+	st := newStream(s, d, c, dec)
 	for {
 		l, err := c.Read(buf)
 		if err != nil {
@@ -91,16 +79,7 @@ func (s *Server) mediaLoop(d *device, c bt.Conn) {
 		if !streaming {
 			continue
 		}
-		ch := cfg.channels()
-		if g != gen {
-			dec.Reset()
-			cc.reset(ch)
-			gen = g
-			budget.reset(cfg.rate, time.Now())
-			tsOnly = 0
-			tsClean = 0
-			haveSSRC = false
-		}
+		st.begin(cfg, g)
 		payload := rtpPayload(buf[:l])
 		if len(payload) < 1 {
 			continue
@@ -112,167 +91,220 @@ func (s *Server) mediaLoop(d *device, c bt.Conn) {
 		}
 		seq := uint16(buf[2])<<8 | uint16(buf[3])
 		ts := uint32(buf[4])<<24 | uint32(buf[5])<<16 | uint32(buf[6])<<8 | uint32(buf[7])
-		lost, tsPause := false, false
-		missing := uint64(1) // packets lost in this gap
-		out = out[:0]
-		cur := uint32(buf[8])<<24 | uint32(buf[9])<<16 | uint32(buf[10])<<8 | uint32(buf[11])
-		ssrcChg := haveSSRC && cur != ssrc
-		ssrc, haveSSRC = cur, true
-		if cc.haveSeq {
-			delta := int16(seq - cc.seq)
-			resync := ssrcChg // a new source: its sequence space is unrelated
-			if !resync {
-				switch {
-				case delta > 0 && delta <= maxSeqJump:
-					lost = delta != 1
-					if lost {
-						missing = uint64(delta - 1)
-					}
-				case delta <= 0 && delta >= -maxSeqJump && dups < maxDupRun:
-					dups++
-					s.dupPkts.Add(1)
-					continue // duplicate or reordered
-				default:
-					// Implausible jump (source restart, or a hostile peer): resync on
-					// this packet instead of muting until the next START.
-					// Also reached after maxDupRun consecutive backward packets: a
-					// restarted sequence landing inside the backward window.
-					resync = true
-				}
-			}
-			if resync {
-				s.resyncs.Add(1)
-				dec.Reset()
-				// Fade the old tail out before reset zeroes it, and fade the new source in.
-				if cc.last != [2]int16{} {
-					out = s.conceal(&cc, out, budget.take(fadeFrames, time.Now()), cfg.rate)
-				}
-				cc.reset(ch)
-				cc.fadeIn = fadeFrames
-				tsOnly = 0
-				tsClean = 0
-			}
-		}
-		dups = 0
-		cc.seq, cc.haveSeq = seq, true
-		// Valid, non-duplicate packet: only now does it count as liveness, so
-		// junk on the channel can't hold the SEP against stale-stream eviction.
-		s.mu.Lock()
-		if d.st == stStreaming && s.owner == d && d.media == c {
-			d.lastRTP = time.Now()
-		}
-		s.mu.Unlock()
-		hdr := payload[0]
-		frames := int(hdr & 0x0F)
-		frameSamples := cfg.blocks * cfg.subbands
-		// Timeline gap (lost packet, or frames dropped from the previous one).
-		// Timestamp jitter under one SBC frame with contiguous sequence numbers
-		// is not loss; a timestamp-only gap never resets the decoder.
-		tsGap := false
-		filled := false
-		if cc.haveTS {
-			gap := int32(ts - cc.nextTS)
+		ssrc := uint32(buf[8])<<24 | uint32(buf[9])<<16 | uint32(buf[10])<<8 | uint32(buf[11])
+		st.onPacket(seq, ts, ssrc, payload)
+	}
+}
+
+// stream is the per-media-channel RTP state: sequence/timestamp tracking, loss
+// concealment and decoding. onPacket does not allocate.
+type stream struct {
+	s   *Server
+	d   *device
+	c   bt.Conn
+	dec decoder
+	cfg sbcConfig
+	gen int // d.gen this state belongs to; -1 before the first packet
+
+	pcm    [256]int16
+	out    []int16 // room for 15 decoded frames plus up to 100 ms of concealment; reused, sink.Write doesn't retain
+	cc     concealer
+	budget concealBudget
+
+	dups   int // consecutive duplicate/reordered drops
+	tsOnly int // consecutive timestamp-only gaps; sticks at maxTSOnlyGaps until a stream reset
+	// tsClean counts consecutive packets whose timestamp matched the decoded timeline.
+	tsClean  int
+	warned   bool
+	ssrc     uint32
+	haveSSRC bool
+}
+
+func newStream(s *Server, d *device, c bt.Conn, dec decoder) *stream {
+	return &stream{s: s, d: d, c: c, dec: dec, gen: -1, out: make([]int16, 0, 16*256+2*4800)}
+}
+
+// begin adopts cfg and, when the START generation changed, resets all stream state.
+func (st *stream) begin(cfg sbcConfig, g int) {
+	st.cfg = cfg
+	if g != st.gen {
+		st.dec.Reset()
+		st.cc.reset(cfg.channels())
+		st.gen = g
+		st.budget.reset(cfg.rate, time.Now())
+		st.tsOnly = 0
+		st.tsClean = 0
+		st.haveSSRC = false
+	}
+}
+
+// onPacket processes one RTP packet; payload starts with the SBC media payload
+// header byte. Decoded audio (and concealment) goes to the sink.
+func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
+	s, d, c, dec, cc, budget, cfg := st.s, st.d, st.c, st.dec, &st.cc, &st.budget, st.cfg
+	ch := cfg.channels()
+	g := st.gen
+	pcm := st.pcm[:]
+	lost, tsPause := false, false
+	missing := uint64(1) // packets lost in this gap
+	out := st.out[:0]
+	ssrcChg := st.haveSSRC && cur != st.ssrc
+	st.ssrc, st.haveSSRC = cur, true
+	if cc.haveSeq {
+		delta := int16(seq - cc.seq)
+		resync := ssrcChg // a new source: its sequence space is unrelated
+		if !resync {
 			switch {
-			case gap <= 0 || !(lost || int(gap) >= frameSamples):
-				if !lost {
-					tsClean++
+			case delta > 0 && delta <= maxSeqJump:
+				lost = delta != 1
+				if lost {
+					missing = uint64(delta - 1)
 				}
-				if tsOnly < maxTSOnlyGaps {
-					tsOnly = 0
-				}
-			case lost:
-				if tsOnly < maxTSOnlyGaps {
-					tsOnly = 0
-				}
-				tsClean = 0
-				tsGap = true
-			case tsOnly < maxTSOnlyGaps:
-				// Conceal only if the timeline was consistent just before:
-				// otherwise this is likely a non-sample RTP clock. Only
-				// concealed gaps count towards the cap.
-				tsGap = tsClean >= minTSCleanPackets
-				if tsGap {
-					tsOnly++
-				}
-				tsClean = 0
-			}
-			// tsOnly stays at the cap (disabled) until the stream is reset.
-			if tsGap {
-				if gap <= int32(cfg.rate/10) { // beyond ~100 ms: restart, don't fill
-					// Fill the whole gap, within a wall-clock budget so a peer
-					// can't push silence faster than realtime.
-					fill := budget.take(int(gap), time.Now())
-					out = s.conceal(&cc, out, fill, cfg.rate)
-					filled = fill > 0
-				} else {
-					tsPause = true
-					cc.fadeIn = fadeFrames
-				}
+			case delta <= 0 && delta >= -maxSeqJump && st.dups < maxDupRun:
+				st.dups++
+				s.dupPkts.Add(1)
+				return // duplicate or reordered
+			default:
+				// Implausible jump (source restart, or a hostile peer): resync on
+				// this packet instead of muting until the next START.
+				// Also reached after maxDupRun consecutive backward packets: a
+				// restarted sequence landing inside the backward window.
+				resync = true
 			}
 		}
-		if lost {
-			dec.Reset() // synthesis history is stale
-		}
-		if lost || (tsGap && !tsPause) { // a pause without SUSPEND loses no packet
-			s.lostPkts.Add(missing)
-		}
-		if lost || tsGap {
-			if !filled && cc.last != [2]int16{} {
-				// No fill (gap too short, negative or over ~100 ms): still fade
-				// the previous audio out so the output doesn't step to zero.
-				out = s.conceal(&cc, out, budget.take(fadeFrames, time.Now()), cfg.rate)
+		if resync {
+			s.resyncs.Add(1)
+			dec.Reset()
+			// Fade the old tail out before reset zeroes it, and fade the new source in.
+			if cc.last != [2]int16{} {
+				out = s.conceal(cc, out, budget.take(fadeFrames, time.Now()), cfg.rate)
 			}
+			cc.reset(ch)
 			cc.fadeIn = fadeFrames
-		}
-		payload = payload[1:]
-		start := len(out)
-		for i := 0; i < frames && len(payload) > 0; i++ {
-			consumed, k, fi, err := dec.Decode(payload, pcm[:])
-			bad := err != nil || consumed <= 0
-			if !bad && (fi.SampleRate != cfg.rate || fi.Channels != ch ||
-				fi.Blocks != cfg.blocks || fi.Subbands != cfg.subbands) {
-				if !warned { // once per stream: don't flood the log
-					warned = true
-					log.Printf("avdtp: %v: dropping frames not matching configured %d Hz/%d ch/%d blocks/%d subbands (got %d Hz/%d ch/%d blocks/%d subbands)",
-						d.addr, cfg.rate, cfg.channels(), cfg.blocks, cfg.subbands,
-						fi.SampleRate, fi.Channels, fi.Blocks, fi.Subbands)
-				}
-				bad = true
-			}
-			if bad {
-				s.badFrames.Add(1)
-				dec.Reset()
-				if (err == nil || errors.Is(err, sbc.ErrCRC)) && consumed > 0 && consumed <= len(payload) {
-					// Frame boundary is known (CRC error or parameter mismatch):
-					// conceal just this frame, keep going.
-					out = s.conceal(&cc, out, budget.take(frameSamples, time.Now()), cfg.rate)
-					payload = payload[consumed:]
-					continue
-				}
-				// Can't resync inside this packet: replace the rest with silence,
-				// within the realtime budget.
-				out = s.conceal(&cc, out, budget.take((frames-i)*frameSamples, time.Now()), cfg.rate)
-				break
-			}
-			cc.fade(pcm[:k])
-			out = append(out, pcm[:k]...)
-			payload = payload[consumed:]
-		}
-		cc.nextTS = ts + uint32((len(out)-start)/ch)
-		cc.haveTS = true
-		if len(out) > 0 {
-			// Re-check under sinkMu, which stopSink holds while dropping: a
-			// late chunk must not reopen the device after Drop/Stop.
-			s.sinkMu.Lock()
-			s.mu.Lock()
-			ok := d.sinkOn && d.gen == g && d.st == stStreaming && d.media == c
-			s.mu.Unlock()
-			if ok {
-				s.sink.Write(out)
-			}
-			s.sinkMu.Unlock()
+			st.tsOnly = 0
+			st.tsClean = 0
 		}
 	}
+	st.dups = 0
+	cc.seq, cc.haveSeq = seq, true
+	// Valid, non-duplicate packet: only now does it count as liveness, so
+	// junk on the channel can't hold the SEP against stale-stream eviction.
+	s.mu.Lock()
+	if d.st == stStreaming && s.owner == d && d.media == c {
+		d.lastRTP = time.Now()
+	}
+	s.mu.Unlock()
+	hdr := payload[0]
+	frames := int(hdr & 0x0F)
+	frameSamples := cfg.blocks * cfg.subbands
+	// Timeline gap (lost packet, or frames dropped from the previous one).
+	// Timestamp jitter under one SBC frame with contiguous sequence numbers
+	// is not loss; a timestamp-only gap never resets the decoder.
+	tsGap := false
+	filled := false
+	if cc.haveTS {
+		gap := int32(ts - cc.nextTS)
+		switch {
+		case gap <= 0 || !(lost || int(gap) >= frameSamples):
+			if !lost {
+				st.tsClean++
+			}
+			if st.tsOnly < maxTSOnlyGaps {
+				st.tsOnly = 0
+			}
+		case lost:
+			if st.tsOnly < maxTSOnlyGaps {
+				st.tsOnly = 0
+			}
+			st.tsClean = 0
+			tsGap = true
+		case st.tsOnly < maxTSOnlyGaps:
+			// Conceal only if the timeline was consistent just before:
+			// otherwise this is likely a non-sample RTP clock. Only
+			// concealed gaps count towards the cap.
+			tsGap = st.tsClean >= minTSCleanPackets
+			if tsGap {
+				st.tsOnly++
+			}
+			st.tsClean = 0
+		}
+		// st.tsOnly stays at the cap (disabled) until the stream is reset.
+		if tsGap {
+			if gap <= int32(cfg.rate/10) { // beyond ~100 ms: restart, don't fill
+				// Fill the whole gap, within a wall-clock budget so a peer
+				// can't push silence faster than realtime.
+				fill := budget.take(int(gap), time.Now())
+				out = s.conceal(cc, out, fill, cfg.rate)
+				filled = fill > 0
+			} else {
+				tsPause = true
+				cc.fadeIn = fadeFrames
+			}
+		}
+	}
+	if lost {
+		dec.Reset() // synthesis history is stale
+	}
+	if lost || (tsGap && !tsPause) { // a pause without SUSPEND loses no packet
+		s.lostPkts.Add(missing)
+	}
+	if lost || tsGap {
+		if !filled && cc.last != [2]int16{} {
+			// No fill (gap too short, negative or over ~100 ms): still fade
+			// the previous audio out so the output doesn't step to zero.
+			out = s.conceal(cc, out, budget.take(fadeFrames, time.Now()), cfg.rate)
+		}
+		cc.fadeIn = fadeFrames
+	}
+	payload = payload[1:]
+	start := len(out)
+	for i := 0; i < frames && len(payload) > 0; i++ {
+		consumed, k, fi, err := dec.Decode(payload, pcm[:])
+		bad := err != nil || consumed <= 0
+		if !bad && (fi.SampleRate != cfg.rate || fi.Channels != ch ||
+			fi.Blocks != cfg.blocks || fi.Subbands != cfg.subbands) {
+			if !st.warned { // once per stream: don't flood the log
+				st.warned = true
+				log.Printf("avdtp: %v: dropping frames not matching configured %d Hz/%d ch/%d blocks/%d subbands (got %d Hz/%d ch/%d blocks/%d subbands)",
+					d.addr, cfg.rate, cfg.channels(), cfg.blocks, cfg.subbands,
+					fi.SampleRate, fi.Channels, fi.Blocks, fi.Subbands)
+			}
+			bad = true
+		}
+		if bad {
+			s.badFrames.Add(1)
+			dec.Reset()
+			if (err == nil || errors.Is(err, sbc.ErrCRC)) && consumed > 0 && consumed <= len(payload) {
+				// Frame boundary is known (CRC error or parameter mismatch):
+				// conceal just this frame, keep going.
+				out = s.conceal(cc, out, budget.take(frameSamples, time.Now()), cfg.rate)
+				payload = payload[consumed:]
+				continue
+			}
+			// Can't resync inside this packet: replace the rest with silence,
+			// within the realtime budget.
+			out = s.conceal(cc, out, budget.take((frames-i)*frameSamples, time.Now()), cfg.rate)
+			break
+		}
+		cc.fade(pcm[:k])
+		out = append(out, pcm[:k]...)
+		payload = payload[consumed:]
+	}
+	cc.nextTS = ts + uint32((len(out)-start)/ch)
+	cc.haveTS = true
+	if len(out) > 0 {
+		// Re-check under sinkMu, which stopSink holds while dropping: a
+		// late chunk must not reopen the device after Drop/Stop.
+		s.sinkMu.Lock()
+		s.mu.Lock()
+		ok := d.sinkOn && d.gen == g && d.st == stStreaming && d.media == c
+		s.mu.Unlock()
+		if ok {
+			s.sink.Write(out)
+		}
+		s.sinkMu.Unlock()
+	}
+	st.out = out
 }
 
 // concealBudget is a leaky bucket bounding gap concealment to realtime plus a
