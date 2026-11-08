@@ -85,7 +85,7 @@ func NewServer() *Server {
 			0x0006: langBase(),
 			0x0009: seqE(seqE(uuidE(0x110D), u16(0x0103))),
 			0x0100: strE("Audio Sink"),
-			0x0311: u16(0x0003),
+			0x0311: u16(0x0002), // SupportedFeatures: Speaker
 		}),
 		newRecord(0x00010002, map[uint16]elem{ // AVRCP Target
 			0x0001: seqE(uuidE(0x110C)),
@@ -297,7 +297,7 @@ func (s *Server) serviceSearch(tid uint16, p []byte, outMTU int) []byte {
 	maxCount := int(binary.BigEndian.Uint16(p[n:]))
 	off, ok := parseCont(p[n+2:])
 	if !ok {
-		return errRsp(tid, errBadSyntax)
+		return errRsp(tid, errBadContinue)
 	}
 	recs := s.matching(pat)
 	if maxCount < len(recs) {
@@ -359,7 +359,7 @@ func (s *Server) serviceAttr(tid uint16, p []byte, outMTU int) []byte {
 	}
 	off, ok := parseCont(p[6+n:])
 	if !ok {
-		return errRsp(tid, errBadSyntax)
+		return errRsp(tid, errBadContinue)
 	}
 	var rec *record
 	for _, r := range s.records {
@@ -385,7 +385,7 @@ func (s *Server) serviceSearchAttr(tid uint16, p []byte, outMTU int) []byte {
 	}
 	off, ok := parseCont(p[n+2+m:])
 	if !ok {
-		return errRsp(tid, errBadSyntax)
+		return errRsp(tid, errBadContinue)
 	}
 	var lists []elem
 	for _, r := range s.matching(pat) {

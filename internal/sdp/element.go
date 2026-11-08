@@ -141,6 +141,9 @@ func decodeDepth(b []byte, depth int) (elem, int, error) {
 		}
 		size = []int{1, 2, 4, 8, 16}[idx]
 		if t == tBool {
+			if idx != 0 {
+				return elem{}, 0, errElem // Bool has size index 0
+			}
 			size = 1
 		}
 	default:

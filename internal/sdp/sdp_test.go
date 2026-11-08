@@ -221,3 +221,22 @@ func FuzzSDP(f *testing.F) {
 		}
 	})
 }
+
+func TestElementBoolSizeIndex(t *testing.T) {
+	if _, _, err := decode([]byte{0x28, 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decode([]byte{0x29, 0, 1}); err == nil {
+		t.Fatal("bool with size index 1 accepted")
+	}
+}
+
+func TestMalformedContinuationState(t *testing.T) {
+	s := NewServer()
+	for _, cont := range [][]byte{{1, 0}, {2, 0}, {0, 0}} {
+		rsp := s.handle(ssaReq(2, 0x110B, 100, cont), 672)
+		if rsp[0] != pduError || binary.BigEndian.Uint16(rsp[5:]) != errBadContinue {
+			t.Fatalf("%x: %x", cont, rsp)
+		}
+	}
+}
