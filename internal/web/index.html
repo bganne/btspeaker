@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-{{- if .Pairing.Open}}
+{{- if and .Pairing.Open (not .Confirm)}}
 <meta http-equiv="refresh" content="5;url=/">
 {{- end}}
 <title>{{or .Adapter.Name "btspeaker"}}</title>
@@ -107,7 +107,7 @@
 <section>
   <h2>Speaker name</h2>
   <form class="row" method="post" action="/ui/name">
-    <input type="text" name="name" value="{{.Adapter.Name}}" maxlength="248" required autocomplete="off">
+    <input type="text" name="name" value="{{.Adapter.Name}}" required autocomplete="off">
     <button>Rename</button>
   </form>
 </section>

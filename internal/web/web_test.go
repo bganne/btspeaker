@@ -214,6 +214,9 @@ func TestUI(t *testing.T) {
 	if b := do(h, "GET", "/", "").Body.String(); !strings.Contains(b, "42 s left") || !strings.Contains(b, "http-equiv=\"refresh\"") {
 		t.Error("pairing open: no countdown/refresh")
 	}
+	if b := do(h, "GET", "/ui/devices/11:22:33:44:55:66/forget", "").Body.String(); strings.Contains(b, "http-equiv=\"refresh\"") {
+		t.Error("forget confirmation page refreshes away while pairing is open")
+	}
 }
 
 func TestHostCheck(t *testing.T) {
