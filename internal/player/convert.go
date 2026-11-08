@@ -36,7 +36,12 @@ type converter struct {
 	target  int32
 	cur     int64 // current gain, Q15<<8
 	rem     int   // ramp frames left
+	silent  int   // frames of silent chunks in a row
 }
+
+// ditherHoldMs is how long dither stays on into silence, so a fading tail does not
+// toggle between dithered and undithered chunks.
+const ditherHoldMs = 100
 
 const rampMs = 10
 
@@ -49,6 +54,7 @@ func (c *converter) convertSilent(dst []byte, pcm []int16, inCh, outCh int, f al
 	if !c.started {
 		c.started, c.target, c.cur = true, gain, int64(gain)<<8
 		c.rng = 0x9e3779b9
+		c.silent = rate // a stream that starts silent is not dithered
 	}
 	if gain != c.target {
 		c.target = gain
@@ -58,8 +64,13 @@ func (c *converter) convertSilent(dst []byte, pcm []int16, inCh, outCh int, f al
 		}
 	}
 	frames := len(pcm) / inCh
+	if silent {
+		c.silent = min(c.silent+frames, rate)
+	} else {
+		c.silent = 0
+	}
 	rng := &c.rng
-	if silent { // keep digital silence exact; quiet audio still gets TPDF
+	if c.silent > rate*ditherHoldMs/1000 { // keep digital silence exact; quiet audio still gets TPDF
 		rng = nil
 	}
 	off := 0

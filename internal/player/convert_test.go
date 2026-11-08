@@ -174,6 +174,18 @@ func TestDitherSilence(t *testing.T) {
 	if nz == 0 {
 		t.Fatal("zero samples of quiet audio not dithered")
 	}
+	// Silence right after audio stays dithered for ditherHoldMs, then is exact.
+	zero := make([]int16, 2048) // 1024 frames, ~23 ms
+	c.convert(dst, zero, 2, 2, alsa.S16LE, unity/2, 44100)
+	if allZero(dst) {
+		t.Fatal("dither dropped right after audio")
+	}
+	for i := 0; i < 5; i++ {
+		c.convert(dst, zero, 2, 2, alsa.S16LE, unity/2, 44100)
+	}
+	if !allZero(dst) {
+		t.Fatal("silence still dithered after the hold")
+	}
 }
 
 // fadeFrames is the fade length at 44.1 kHz.
@@ -235,4 +247,13 @@ func TestConvertS32Extremes(t *testing.T) {
 			}
 		}
 	}
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
