@@ -60,7 +60,8 @@ func loadKeysTolerant(do func(params []byte) error, keys []Key, batchFailed bool
 // reloadKeysLocked restores the stored link keys in the kernel after an
 // Unpair or a flushed non-persistent key removed one (Load Link Keys replaces
 // the kernel's whole list, so all stored keys are sent), admitting every key
-// that loaded. Needs winMu: a concurrent Forget must not interleave between
+// that loaded. Session keys of connected no-bonding peers are lost too; such a
+// peer must re-pair (rare; documented in the README). Needs winMu: a concurrent Forget must not interleave between
 // the Store.Has check and the load. Does nothing if addr is no longer stored.
 func (c *Controller) reloadKeysLocked(addr bt.Addr) {
 	if !c.cfg.Store.Has(addr) {

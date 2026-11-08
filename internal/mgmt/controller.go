@@ -291,7 +291,7 @@ func (c *Controller) cmd(op uint16, params []byte) ([]byte, error) {
 	cl, idx, present := c.cl, c.index, c.present
 	c.mu.Unlock()
 	if !present {
-		return nil, errors.New("bluetooth adapter not present")
+		return nil, ErrNoAdapter
 	}
 	return cl.Do(idx, op, params)
 }
@@ -434,10 +434,11 @@ func (c *Controller) pairingAllowed() bool {
 	return PairingAllowed(time.Now(), c.deadline, c.cfg.AlwaysPairable)
 }
 
-// Errors the web layer maps to 404/409 instead of a generic failure.
+// Errors the web layer maps to 404/409/503 instead of a generic failure.
 var (
 	ErrUnknownDevice = errors.New("unknown device")
 	ErrNotConnected  = errors.New("device not connected")
+	ErrNoAdapter     = errors.New("bluetooth adapter not present")
 )
 
 // Disconnect drops the connection to addr.
@@ -953,7 +954,11 @@ func (c *Controller) handle(ev Event) {
 		if err != nil {
 			return
 		}
-		c.log.Warn("connect failed", "addr", addr.String(), "status", Status0(rest))
+		lvl := slog.LevelWarn
+		if !c.cfg.Store.Has(addr) {
+			lvl = slog.LevelDebug // strangers: rejected incoming ACLs must not flood the log
+		}
+		c.log.Log(context.Background(), lvl, "connect failed", "addr", addr.String(), "status", Status0(rest))
 	case EvControllerError:
 		c.log.Warn("controller error", "params", fmt.Sprintf("%x", ev.Params))
 	}

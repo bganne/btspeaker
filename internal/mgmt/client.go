@@ -197,7 +197,8 @@ func (c *Client) readLoop() {
 		default:
 			// Pairing/key events must not be lost (a dropped key means a re-pair).
 			crit := h.Code == EvNewLinkKey || h.Code == EvUserConfirmReq || h.Code == EvPINCodeRequest ||
-				h.Code == EvDeviceDisconn || h.Code == EvIndexAdded || h.Code == EvIndexRemoved
+				h.Code == EvDeviceDisconn || h.Code == EvIndexAdded || h.Code == EvIndexRemoved ||
+				h.Code == EvNewSettings // a lost one leaves Powered/Discoverable stale
 			c.enqueue(Event{h.Code, h.Index, params}, crit)
 		}
 	}
