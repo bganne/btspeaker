@@ -86,9 +86,12 @@ type Server struct {
 
 	mu   sync.Mutex
 	regs map[bt.Conn]byte // conns with a pending volume notification -> AVCTP label
+	busy map[bt.Conn]bool // conns with a notification write in flight
 }
 
-func NewServer(v Volume) *Server { return &Server{vol: v, regs: map[bt.Conn]byte{}} }
+func NewServer(v Volume) *Server {
+	return &Server{vol: v, regs: map[bt.Conn]byte{}, busy: map[bt.Conn]bool{}}
+}
 
 // HandleConn serves one accepted PSM 23 channel until it closes (blocks).
 func (s *Server) HandleConn(c bt.Conn) {
@@ -146,10 +149,23 @@ func (s *Server) NotifyVolume(v uint8) {
 	s.mu.Lock()
 	regs := s.regs
 	s.regs = map[bt.Conn]byte{}
+	var send []bt.Conn
+	for c := range regs {
+		if !s.busy[c] { // a stuck peer gets at most one blocked writer
+			s.busy[c] = true
+			send = append(send, c)
+		}
+	}
 	s.mu.Unlock()
-	for c, label := range regs {
-		pkt := avctp(label, true, false, pidAVRCP, vendor(respChanged, subunitPanel, pduRegisterNotif, []byte{eventVolume, v & 0x7F}))
-		write(c, pkt)
+	for _, c := range send {
+		pkt := avctp(regs[c], true, false, pidAVRCP, vendor(respChanged, subunitPanel, pduRegisterNotif, []byte{eventVolume, v & 0x7F}))
+		// Own goroutine: one peer blocking up to writeTimeout must not delay the others or the caller.
+		go func() {
+			write(c, pkt)
+			s.mu.Lock()
+			delete(s.busy, c)
+			s.mu.Unlock()
+		}()
 	}
 }
 
@@ -176,12 +192,7 @@ func isAVRCP(p []byte) bool {
 	return len(p) >= 6 && p[0]>>2&3 == 0 && uint16(p[1])<<8|uint16(p[2]) == pidAVRCP
 }
 
-func (s *Server) handle(c bt.Conn, p []byte) []byte {
-	rsp, _ := s.process(c, p)
-	return rsp
-}
-
-// process is handle plus whether a PASS THROUGH step changed the volume (the
+// process handles one AVCTP packet and reports whether a PASS THROUGH step changed the volume (the
 // caller then owes registered peers an EVENT_VOLUME_CHANGED).
 func (s *Server) process(c bt.Conn, p []byte) (rsp []byte, volChanged bool) {
 	if len(p) < 3 {

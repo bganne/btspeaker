@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -383,5 +384,71 @@ func TestGetCapsNeedsStatusCtype(t *testing.T) {
 	got := s.handle(newFakeConn(), []byte{0x40, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x10, 0x00, 0x00, 0x01, 0x02})
 	if len(got) < 4 || got[3] != 0x08 {
 		t.Fatalf("got %x", got)
+	}
+}
+
+func (s *Server) handle(c bt.Conn, p []byte) []byte {
+	rsp, _ := s.process(c, p)
+	return rsp
+}
+
+// blockConn's Write blocks until release is closed.
+type blockConn struct {
+	*fakeConn
+	release chan struct{}
+	writes  atomic.Int32
+}
+
+func (b *blockConn) Write(p []byte) (int, error) {
+	b.writes.Add(1)
+	<-b.release
+	return len(p), nil
+}
+
+func TestNotifyVolumeStuckPeer(t *testing.T) {
+	s := NewServer(&fakeVol{})
+	stuck := &blockConn{fakeConn: newFakeConn(), release: make(chan struct{})}
+	good := newFakeConn()
+	s.mu.Lock()
+	s.regs[stuck] = 1
+	s.regs[good] = 2
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() { s.NotifyVolume(0x10); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("NotifyVolume blocked on a stuck peer")
+	}
+	select {
+	case <-good.out:
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy peer not notified")
+	}
+	// Re-register the stuck peer: no second writer while the first is in flight.
+	for range 3 {
+		s.mu.Lock()
+		s.regs[stuck] = 1
+		s.mu.Unlock()
+		s.NotifyVolume(0x11)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := stuck.writes.Load(); n != 1 {
+		t.Fatalf("stuck peer writers = %d, want 1", n)
+	}
+	close(stuck.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		n := len(s.busy)
+		s.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("busy flag never cleared")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
