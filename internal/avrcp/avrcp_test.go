@@ -437,6 +437,12 @@ func TestNotifyVolumeStuckPeer(t *testing.T) {
 	if n := stuck.writes.Load(); n != 1 {
 		t.Fatalf("stuck peer writers = %d, want 1", n)
 	}
+	s.mu.Lock()
+	label, kept := s.regs[stuck]
+	s.mu.Unlock()
+	if !kept || label != 1 {
+		t.Fatal("busy peer lost its registration")
+	}
 	close(stuck.release)
 	deadline := time.Now().Add(2 * time.Second)
 	for {

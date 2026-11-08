@@ -154,6 +154,8 @@ func (s *Server) NotifyVolume(v uint8) {
 		if !s.busy[c] { // a stuck peer gets at most one blocked writer
 			s.busy[c] = true
 			send = append(send, c)
+		} else {
+			s.regs[c] = regs[c] // keep the one-shot registration for the next change
 		}
 	}
 	s.mu.Unlock()
