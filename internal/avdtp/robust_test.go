@@ -1,6 +1,7 @@
 package avdtp
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"sync"
@@ -616,5 +617,126 @@ func TestParameterMismatchSkipsOneFrame(t *testing.T) {
 	}
 	if pcm[767] != 10000 {
 		t.Fatal("frame after the mismatched one was dropped")
+	}
+}
+
+// crcFakeDec fails frames starting with 0xFF with ErrCRC (length known).
+type crcFakeDec struct{ fakeDec }
+
+func (d *crcFakeDec) Decode(f []byte, pcm []int16) (int, int, sbc.FrameInfo, error) {
+	if len(f) >= 4 && f[0] == 0xFF {
+		return 4, 0, sbc.FrameInfo{}, sbc.ErrCRC
+	}
+	return d.fakeDec.Decode(f, pcm)
+}
+
+func TestCRCErrorKeepsDecoderState(t *testing.T) {
+	sink := &fakeSink{}
+	s := newTestServer(sink)
+	dec := &crcFakeDec{}
+	s.newDecoder = func() decoder { return dec }
+	sig := newConn(1)
+	media := openStream(t, s, sig)
+	media.in <- rtp(1, 0, 1, 2, 3, 4)
+	waitFor(t, func() bool { _, n := sink.get(); return n >= 4 })
+	before := dec.resets
+	media.in <- rtp(2, 2, 0xFF, 2, 3, 4)
+	media.in <- rtp(3, 4, 1, 2, 3, 4)
+	waitFor(t, func() bool { return s.Stats().BadFrames >= 1 })
+	waitFor(t, func() bool { _, n := sink.get(); return n >= 8 })
+	if dec.resets != before {
+		t.Fatalf("decoder reset on CRC error: %d -> %d", before, dec.resets)
+	}
+}
+
+func TestMediaChannelCarryingSignallingIsHandedOver(t *testing.T) {
+	s := newTestServer(&fakeSink{})
+	sig := newConn(1)
+	go s.HandleConn(sig)
+	expect(t, sig, "setconf", append([]byte{0x30, 0x03}, setConf...), []byte{0x32, 0x03})
+	expect(t, sig, "open", []byte{0x60, 0x06, 0x04}, []byte{0x62, 0x06})
+	// The phone reconnected: its new signalling channel arrives while the
+	// old session is OPEN, so it is first taken for media.
+	nsig := newConn(1)
+	go s.HandleConn(nsig)
+	waitFor(t, func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.devs[sig.addr].media == nsig })
+	// DISCOVER (label 5): the first packet must be answered, not dropped.
+	r := rpc(t, nsig, []byte{0x50, 0x01})
+	if len(r) < 2 || r[0] != 0x52 || r[1] != 0x01 {
+		t.Fatalf("discover reply %x", r)
+	}
+	s.mu.Lock()
+	d := s.devs[sig.addr]
+	ok := d.sig == any(nsig) && d.media == nil
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("session not replaced")
+	}
+	// The old signalling channel was evicted.
+	if _, open := <-sig.in; open {
+		t.Fatal("old signalling channel still open")
+	}
+	// The new channel keeps working.
+	expect(t, nsig, "setconf", append([]byte{0x30, 0x03}, setConf...), []byte{0x32, 0x03})
+}
+
+// A reconnect whose first command is SET_CONFIGURATION with label 8–11 has an
+// RTP-like first byte (0x9x): it must still be taken for signalling.
+func TestMediaChannelSignallingHighLabel(t *testing.T) {
+	s := newTestServer(&fakeSink{})
+	sig := newConn(1)
+	go s.HandleConn(sig)
+	expect(t, sig, "setconf", append([]byte{0x30, 0x03}, setConf...), []byte{0x32, 0x03})
+	expect(t, sig, "open", []byte{0x60, 0x06, 0x04}, []byte{0x62, 0x06})
+	nsig := newConn(1)
+	go s.HandleConn(nsig)
+	waitFor(t, func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.devs[sig.addr].media == nsig })
+	cmd := append([]byte{0x90, 0x03}, setConf...)
+	if !(len(cmd) >= 12 && cmd[0]>>6 == 2) {
+		t.Fatal("test packet does not look like RTP")
+	}
+	r := rpc(t, nsig, cmd)
+	if len(r) < 2 || r[0]&0xF0 != 0x90 || r[1] != 0x03 {
+		t.Fatalf("setconf reply %x", r)
+	}
+}
+
+func TestMediaOnlyAcceptedWhenOpen(t *testing.T) {
+	s := newTestServer(&fakeSink{})
+	sig := newConn(1)
+	go s.HandleConn(sig)
+	expect(t, sig, "setconf", append([]byte{0x30, 0x03}, setConf...), []byte{0x32, 0x03})
+	// Configured but not OPEN: a second channel is a new signalling channel.
+	nsig := newConn(1)
+	go s.HandleConn(nsig)
+	r := rpc(t, nsig, []byte{0x50, 0x01})
+	if len(r) < 2 || r[0] != 0x52 {
+		t.Fatalf("discover reply %x", r)
+	}
+}
+
+func TestParseCapsDuplicateCategory(t *testing.T) {
+	_, _, bad, ok := parseCaps([]byte{catMediaTransport, 0, catMediaCodec, 1, 0, catMediaCodec, 0})
+	if ok || bad != catMediaCodec {
+		t.Fatalf("ok=%v bad=%#x", ok, bad)
+	}
+	s := newTestServer(&fakeSink{})
+	d := &device{}
+	p := append(append([]byte(nil), setConf...), catMediaTransport, 0)
+	r := s.doSetConfig(d, 3, p)
+	if !bytes.Equal(r, []byte{0x33, 0x03, catMediaTransport, errBadServCategory}) {
+		t.Fatalf("%x", r)
+	}
+}
+
+func TestReassemblyMessageTypeMustMatchStart(t *testing.T) {
+	s := newTestServer(&fakeSink{})
+	d := &device{}
+	_, _, _, _, ok := s.reassemble(d, []byte{0x04, 0x02, 0x03, 4}) // START, command
+	if ok {
+		t.Fatal("start completed")
+	}
+	if _, _, _, _, ok := s.reassemble(d, []byte{0x0E, 0x08}); ok { // END, accept
+		t.Fatal("END with different message type accepted")
 	}
 }

@@ -103,6 +103,7 @@ const maxReassembled = 1024
 
 type reassembly struct {
 	label  byte
+	msg    byte // message type from the START fragment
 	nPkts  int
 	got    int
 	signal byte
@@ -185,6 +186,9 @@ func parseCaps(b []byte) (caps map[byte][]byte, order []byte, badCat byte, ok bo
 			return nil, nil, 0, false
 		}
 		cat, l := b[0], int(b[1])
+		if _, dup := caps[cat]; dup {
+			return nil, nil, cat, false
+		}
 		caps[cat] = b[2 : 2+l]
 		order = append(order, cat)
 		b = b[2+l:]
@@ -261,7 +265,7 @@ func (s *Server) validateSBC(ie []byte) (sbcConfig, byte) {
 func hdr(label, pkt, msg byte) byte { return label<<4 | pkt<<2 | msg }
 
 // signalling serves the signalling channel of d until it closes.
-func (s *Server) signalling(d *device, c bt.Conn) {
+func (s *Server) signalling(d *device, c bt.Conn, first []byte) {
 	defer func() {
 		s.release(d)
 		s.mu.Lock()
@@ -287,7 +291,14 @@ func (s *Server) signalling(d *device, c bt.Conn) {
 			dl.SetDeadline(t) // under mu: must not overwrite a concurrent re-arm
 			s.mu.Unlock()
 		}
-		l, err := c.Read(buf)
+		var l int
+		var err error
+		if first != nil {
+			l = copy(buf, first)
+			first = nil
+		} else {
+			l, err = c.Read(buf)
+		}
 		if err != nil {
 			// The deadline was armed before the media channel arrived: if one
 			// exists now, the timeout no longer applies.
@@ -342,11 +353,11 @@ func (s *Server) reassemble(d *device, p []byte) (label, sig byte, params []byte
 		if len(p) < 3 || p[1] < 2 {
 			return
 		}
-		d.reasm = &reassembly{label: label, nPkts: int(p[1]), got: 1, signal: p[2] & 0x3F, data: append([]byte(nil), p[3:]...)}
+		d.reasm = &reassembly{label: label, msg: msg, nPkts: int(p[1]), got: 1, signal: p[2] & 0x3F, data: append([]byte(nil), p[3:]...)}
 		return
 	case pktContinue, pktEnd:
 		r := d.reasm
-		if r == nil || r.label != label {
+		if r == nil || r.label != label || r.msg != msg {
 			d.reasm = nil
 			return
 		}
@@ -363,7 +374,7 @@ func (s *Server) reassemble(d *device, p []byte) (label, sig byte, params []byte
 		if r.got != r.nPkts {
 			return
 		}
-		return label, r.signal, r.data, msg, true
+		return label, r.signal, r.data, r.msg, true
 	}
 	return
 }
@@ -438,7 +449,10 @@ func (s *Server) doSetConfig(d *device, label byte, p []byte) []byte {
 	if p[0]>>2 != localSEID {
 		return reject(label, sigSetConfig, 0, errBadACPSEID)
 	}
-	caps, order, _, ok := parseCaps(p[2:])
+	caps, order, badCat, ok := parseCaps(p[2:])
+	if !ok && badCat != 0 {
+		return reject(label, sigSetConfig, badCat, errBadServCategory)
+	}
 	if !ok {
 		return reject(label, sigSetConfig, 0, errBadLength)
 	}
@@ -520,7 +534,10 @@ func (s *Server) doReconfigure(d *device, label byte, p []byte) []byte {
 	if p[0]>>2 != localSEID {
 		return reject(label, sigReconfigure, 0, errBadACPSEID)
 	}
-	caps, order, _, ok := parseCaps(p[1:])
+	caps, order, badCat, ok := parseCaps(p[1:])
+	if !ok && badCat != 0 {
+		return reject(label, sigReconfigure, badCat, errBadServCategory)
+	}
 	if !ok {
 		return reject(label, sigReconfigure, 0, errBadLength)
 	}

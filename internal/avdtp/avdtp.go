@@ -229,8 +229,8 @@ func (s *Server) HandleConn(c bt.Conn) {
 		d = &device{addr: addr, sig: c}
 		s.devs[addr] = d
 		s.mu.Unlock()
-		s.signalling(d, c)
-	case d.media == nil && d.st >= stOpen && s.owner == d:
+		s.signalling(d, c, nil)
+	case d.media == nil && d.st == stOpen && s.owner == d:
 		d.media = c
 		if d.openTmr != nil {
 			d.openTmr.Stop()
@@ -240,19 +240,25 @@ func (s *Server) HandleConn(c bt.Conn) {
 		s.mu.Unlock()
 		s.mediaLoop(d, c)
 	default:
-		// The device opened a new signalling channel while an old session
-		// (possibly with media) lingers: the old one is stale (link loss not
-		// yet detected, supervision timeout pending). Evict it, media
-		// included, and start from a fresh device state.
-		old := d
+		s.replaceSession(d, c, nil) // unlocks s.mu
+	}
+}
+
+// replaceSession serves c as the new signalling channel of d's address. An
+// existing session d (nil if gone) is stale (link loss not yet detected,
+// supervision timeout pending): it is evicted, media included, and replaced by
+// a fresh device state. first, if non-nil, is a signalling packet already read
+// from c. Called with s.mu held, which it releases; blocks until c closes.
+func (s *Server) replaceSession(old *device, c bt.Conn, first []byte) {
+	d := &device{addr: c.RemoteAddr(), sig: c}
+	s.devs[d.addr] = d
+	s.mu.Unlock()
+	if old != nil {
 		osig := old.sig
-		d = &device{addr: addr, sig: c}
-		s.devs[addr] = d
-		s.mu.Unlock()
 		s.release(old)
 		osig.Close()
-		s.signalling(d, c)
 	}
+	s.signalling(d, c, first)
 }
 
 // stopSink stops the sink if this device started it, draining queued audio

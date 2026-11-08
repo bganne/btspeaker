@@ -36,6 +36,7 @@ func (s *Server) conceal(cc *concealer, out []int16, n, rate int) []int16 {
 // mediaLoop reads RTP/SBC packets from the media channel of d until it closes.
 func (s *Server) mediaLoop(d *device, c bt.Conn) {
 	dec := s.newDecoder()
+	handed := false // c became a signalling channel: it must stay open
 	defer func() {
 		s.mu.Lock()
 		owns := d.media == c
@@ -58,7 +59,9 @@ func (s *Server) mediaLoop(d *device, c bt.Conn) {
 		if owns { // a newer channel's stream must not be cut by this stale loop
 			s.stopSink(d, false)
 		}
-		c.Close()
+		if !handed {
+			c.Close()
+		}
 	}()
 	n := c.InMTU()
 	if n < 672 {
@@ -66,9 +69,22 @@ func (s *Server) mediaLoop(d *device, c bt.Conn) {
 	}
 	buf := make([]byte, n)
 	st := newStream(s, d, c, dec)
-	for {
+	for first := true; ; first = false {
 		l, err := c.Read(buf)
 		if err != nil {
+			return
+		}
+		if first && !isRTP(buf[:l]) {
+			// Not media: a new signalling channel (e.g. a reconnect before the
+			// old session timed out). Replace the stale session with it.
+			handed = true
+			pkt := append([]byte(nil), buf[:l]...)
+			s.mu.Lock()
+			if d.media == c {
+				d.media = nil
+			}
+			old := s.devs[d.addr]
+			s.replaceSession(old, c, pkt) // unlocks s.mu
 			return
 		}
 		s.mu.Lock()
@@ -120,8 +136,13 @@ type stream struct {
 	haveSSRC bool
 }
 
+// outCap is the initial st.out capacity in samples (~40 KB): 15 frames plus
+// 100 ms of fill at 48 kHz stereo plus the fade/concealment budget, with
+// margin, so the steady state never reallocates.
+const outCap = 20000
+
 func newStream(s *Server, d *device, c bt.Conn, dec decoder) *stream {
-	return &stream{s: s, d: d, c: c, dec: dec, gen: -1, out: make([]int16, 0, 16*256+2*4800)}
+	return &stream{s: s, d: d, c: c, dec: dec, gen: -1, out: make([]int16, 0, outCap)}
 }
 
 // begin adopts cfg and, when the START generation changed, resets all stream state.
@@ -273,7 +294,9 @@ func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
 		}
 		if bad {
 			s.badFrames.Add(1)
-			dec.Reset()
+			if err == nil || !errors.Is(err, sbc.ErrCRC) {
+				dec.Reset() // a CRC failure leaves the decoder state untouched
+			}
 			if (err == nil || errors.Is(err, sbc.ErrCRC)) && consumed > 0 && consumed <= len(payload) {
 				// Frame boundary is known (CRC error or parameter mismatch):
 				// conceal just this frame, keep going.
@@ -335,6 +358,18 @@ func (b *concealBudget) take(want int, now time.Time) int {
 	n := min(int64(max(want, 0)), b.credit)
 	b.credit -= n
 	return int(n)
+}
+
+// isRTP reports whether b starts with a plausible RTP version 2 header.
+// AVDTP signalling with transaction label 8–11 also has 2 in the top bits, so
+// a single-packet header (packet type 0) whose second byte is a signal id
+// (RFA zero, id ≤ DELAYREPORT) is taken for signalling. A2DP RTP uses a
+// dynamic payload type (second byte ≥ 0x60), so it is not affected.
+func isRTP(b []byte) bool {
+	if len(b) < 12 || b[0]>>6 != 2 {
+		return false
+	}
+	return b[0]&0x0C != 0 || b[1] > 0x0D
 }
 
 // rtpPayload strips the RTP header (CSRCs, extension, padding); nil if malformed.
