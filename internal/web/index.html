@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{- if .Pairing.Open}}
+<meta http-equiv="refresh" content="5">
+{{- end}}
+<title>{{or .Adapter.Name "btspeaker"}}</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 40rem; margin-inline: auto; background: #f4f4f6; color: #222; }
+  h1 { font-size: 1.3rem; margin: 0 0 .2rem; }
+  h2 { font-size: 1rem; margin: 0 0 .5rem; text-transform: uppercase; letter-spacing: .05em; color: #666; }
+  section { background: #fff; border-radius: .5rem; padding: .8rem 1rem; margin: .8rem 0; box-shadow: 0 1px 2px #0002; }
+  form { margin: 0; }
+  .muted { color: #777; font-size: .9rem; }
+  button, .btn { font: inherit; padding: .45rem .8rem; border: 1px solid #889; border-radius: .4rem; background: #eef; color: inherit; cursor: pointer; text-decoration: none; display: inline-block; line-height: normal; }
+  .danger { background: #fee; border-color: #a88; }
+  .primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  input[type=text] { font: inherit; padding: .4rem; border: 1px solid #aab; border-radius: .4rem; min-width: 0; flex: 1; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }
+  .dev { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .5rem 0; border-top: 1px solid #eee; flex-wrap: wrap; }
+  .dev:first-child { border-top: 0; }
+  .badge { font-size: .75rem; padding: .1rem .5rem; border-radius: 1rem; background: #ddd; margin-left: .4rem; }
+  .badge.on { background: #bbf7d0; color: #14532d; }
+  .err { color: #b91c1c; }
+  meter { width: 100%; height: 1rem; }
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>{{or .Adapter.Name "btspeaker"}}</h1>
+  <a href="/" class="muted">Refresh</a>
+</div>
+<div class="muted">{{if .Adapter.Present}}{{.Adapter.Addr}}{{if not .Adapter.Powered}} (powered off){{end}}{{else}}adapter not present{{end}}</div>
+{{- with .Flash}}<p class="err">{{.}}</p>{{end}}
+{{- with .LastError}}<p class="err">{{.}}</p>{{end}}
+{{- with .Confirm}}
+
+<section>
+  <h2>Forget device</h2>
+  <p>Forget <b>{{or .Name .Addr}}</b>{{if .Name}} <span class="muted">({{.Addr}})</span>{{end}}? It will have to pair again to play here.</p>
+  <div class="row">
+    <form method="post" action="/ui/devices/{{.Addr}}/forget"><button class="danger">Forget</button></form>
+    <a class="btn" href="/">Cancel</a>
+  </div>
+</section>
+{{- else}}
+
+<section>
+  <h2>Pairing</h2>
+  <div class="row">
+  {{- if .Pairing.Always}}
+    <button disabled>Always pairable</button>
+  {{- else if .Pairing.Open}}
+    <form method="post" action="/ui/pairing/close"><button class="primary">Stop pairing</button></form>
+    <span class="muted">Discoverable, {{.Pairing.RemainingSeconds}} s left</span>
+  {{- else}}
+    <form method="post" action="/ui/pairing/open"><button class="primary"{{if not .Adapter.Present}} disabled{{end}}>Start pairing</button></form>
+    <span class="muted">Not discoverable</span>
+  {{- end}}
+  </div>
+</section>
+
+<section>
+  <h2>Devices</h2>
+  <div>
+  {{- range .Devices}}
+    <div class="dev">
+      <div>{{or .Name .Addr}}<span class="badge{{if .Connected}} on{{end}}">{{if .Connected}}connected{{else}}offline{{end}}</span>
+        <div class="muted">{{.Addr}}</div></div>
+      <div class="row">
+        {{- if .Connected}}
+        <form method="post" action="/ui/devices/{{.Addr}}/disconnect"><button>Disconnect</button></form>
+        {{- end}}
+        <a class="btn danger" href="/ui/devices/{{.Addr}}/forget">Forget…</a>
+      </div>
+    </div>
+  {{- else}}
+    <div class="muted">No paired devices</div>
+  {{- end}}
+  </div>
+</section>
+
+<section>
+  <h2>Stream</h2>
+  <div class="muted">
+  {{- with .Stream}}{{$.DeviceName .Device}}: {{.State}}
+    {{- if .SampleRate}}, {{.SampleRate}} Hz{{end}}{{with .Mode}}, {{.}}{{end}}{{with .Bitpool}}, bitpool {{.}}{{end}}{{if .Playing}} (playing){{end}}
+  {{- else}}idle{{end}}</div>
+  {{- if .VolumeIgnored}}
+  <div class="muted" style="margin-top:.5rem">Volume: bit-perfect output, source volume ignored</div>
+  {{- else}}
+  <meter min="0" max="127" value="{{.Volume}}" style="margin-top:.5rem">{{.VolumePercent}}%</meter>
+  <div class="muted">Volume {{.VolumePercent}}%</div>
+  {{- end}}
+  {{- with .Diag}}
+  <details class="muted" style="margin-top:.5rem"><summary>Diagnostics</summary>
+    Underruns {{.Xruns}} · queue drops {{.QueueDropFrames}} frames · lost packets {{.LostPackets}} · bad frames {{.BadFrames}} · concealed {{.ConcealedMs}} ms · dropped dup {{.DroppedDup}} · resyncs {{.Resyncs}}
+    <div>Counters since start; JSON at <a href="/api/status">/api/status</a>.</div>
+  </details>
+  {{- end}}
+</section>
+
+{{- if not .Pairing.Open}}
+<section>
+  <h2>Speaker name</h2>
+  <form class="row" method="post" action="/ui/name">
+    <input type="text" name="name" value="{{.Adapter.Name}}" maxlength="248" required autocomplete="off">
+    <button>Rename</button>
+  </form>
+</section>
+{{- end}}
+{{- end}}
+</body>
+</html>
