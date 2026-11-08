@@ -147,8 +147,8 @@ func decodeDepth(b []byte, depth int) (elem, int, error) {
 			size = 1
 		}
 	default:
-		if t == tUint || t == tInt || t == tUUID {
-			return elem{}, 0, errElem // fixed-size types only use size indexes 0-4
+		if t == tUint || t == tInt || t == tUUID || t == tBool {
+			return elem{}, 0, errElem // fixed-size types only use size indexes 0-4 (Bool only 0)
 		}
 		w := []int{1, 2, 4}[idx-5]
 		if len(b) < pos+w {

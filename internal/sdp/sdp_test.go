@@ -229,6 +229,11 @@ func TestElementBoolSizeIndex(t *testing.T) {
 	if _, _, err := decode([]byte{0x29, 0, 1}); err == nil {
 		t.Fatal("bool with size index 1 accepted")
 	}
+	for _, b := range [][]byte{{0x2D, 1, 1}, {0x2E, 0, 1, 1}, {0x2F, 0, 0, 0, 1, 1}} {
+		if _, _, err := decode(b); err == nil {
+			t.Fatalf("bool with size index %d accepted", b[0]&7)
+		}
+	}
 }
 
 func TestMalformedContinuationState(t *testing.T) {
