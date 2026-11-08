@@ -196,7 +196,8 @@ func (c *Client) readLoop() {
 			c.log.Debug("mgmt: unmatched command result", "op", op, "status", st)
 		default:
 			// Pairing/key events must not be lost (a dropped key means a re-pair).
-			crit := h.Code == EvNewLinkKey || h.Code == EvUserConfirmReq || h.Code == EvPINCodeRequest
+			crit := h.Code == EvNewLinkKey || h.Code == EvUserConfirmReq || h.Code == EvPINCodeRequest ||
+				h.Code == EvDeviceDisconn || h.Code == EvIndexAdded || h.Code == EvIndexRemoved
 			c.enqueue(Event{h.Code, h.Index, params}, crit)
 		}
 	}

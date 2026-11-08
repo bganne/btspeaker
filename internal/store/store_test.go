@@ -367,7 +367,7 @@ func TestFailedRemoveRestoredDespiteTouch(t *testing.T) {
 	}
 }
 
-func TestOpenTightensPerms(t *testing.T) {
+func TestOpenPerms(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "st")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -379,9 +379,19 @@ func TestOpenTightensPerms(t *testing.T) {
 	if _, err := Open(dir); err != nil {
 		t.Fatal(err)
 	}
-	for p, want := range map[string]os.FileMode{dir: 0o700, path: 0o600} {
+	for p, want := range map[string]os.FileMode{dir: 0o755, path: 0o600} {
 		if fi, _ := os.Stat(p); fi.Mode().Perm() != want {
 			t.Errorf("%s: %v", p, fi.Mode().Perm())
 		}
+	}
+}
+
+func TestOpenNewDirIs0700(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "new")
+	if _, err := Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Errorf("new dir: %v", fi.Mode().Perm())
 	}
 }

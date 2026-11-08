@@ -76,13 +76,17 @@ const lastSeenSaveInterval = time.Hour
 // empty store. A corrupt file is renamed to state.json.corrupt and the store
 // starts empty (see Corrupt) rather than failing startup forever.
 func Open(dir string) (*Store, error) {
+	// Only a directory we create is restricted (the link keys are secrets); an
+	// existing one is the operator's (e.g. a shared /var/lib parent) and is
+	// left alone. The state file itself is always written 0600.
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// MkdirAll leaves an existing directory and file as they are: tighten them
-	// (best effort; the link keys are secrets).
-	if err := os.Chmod(dir, 0o700); err != nil {
-		slog.Warn("store: cannot restrict directory permissions", "dir", dir, "err", err)
+	if statErr != nil {
+		if err := os.Chmod(dir, 0o700); err != nil { // MkdirAll is subject to umask
+			slog.Warn("store: cannot restrict directory permissions", "dir", dir, "err", err)
+		}
 	}
 	s := &Store{path: filepath.Join(dir, "state.json")}
 	b, err := os.ReadFile(s.path)
@@ -183,18 +187,18 @@ func (s *Store) normalise() (dropped bool) {
 const MaxDevices = 32
 
 // EvictOldest removes the devices with the oldest last_seen (never keep) until
-// at most max remain, and returns their addresses. It reports nothing on a
+// at most limit remain, and returns their addresses. It reports nothing on a
 // save failure beyond the in-memory rollback; the caller unpairs the result.
-func (s *Store) EvictOldest(keep bt.Addr, max int) []bt.Addr {
+func (s *Store) EvictOldest(keep bt.Addr, limit int) []bt.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.st.Devices) <= max {
+	if len(s.st.Devices) <= limit {
 		return nil
 	}
 	undo := s.snapshotLocked()
 	ks := keep.String()
 	var out []bt.Addr
-	for len(s.st.Devices) > max {
+	for len(s.st.Devices) > limit {
 		oi := -1
 		for i, d := range s.st.Devices {
 			if d.Addr != ks && (oi < 0 || d.LastSeen.Before(s.st.Devices[oi].LastSeen)) {

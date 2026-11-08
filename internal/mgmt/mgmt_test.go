@@ -981,8 +981,13 @@ func TestNoBondingKeyWindowClosedRefused(t *testing.T) {
 	}
 	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(known, false))
 	waitFor(t, "unpair", func() bool { return fake.count(OpUnpairDevice) == 1 })
-	if c.Admit(known) {
-		t.Fatal("no-bonding key outside the window kept the address admitted")
+	// The real key is restored in the kernel and the device stays admitted.
+	waitFor(t, "reload", func() bool { return fake.count(OpLoadLinkKeys) == 2 })
+	if !c.Admit(known) {
+		t.Fatal("bonded device refused after a refused no-bonding key")
+	}
+	if p := fake.lastParams(OpLoadLinkKeys); len(p) != 3+25 {
+		t.Fatalf("reload params %d bytes, want one key", len(p))
 	}
 }
 
@@ -1058,5 +1063,16 @@ func TestShutdownAbortsInit(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Shutdown blocked behind initAdapter")
+	}
+}
+
+func TestSanitizeNameCaps248(t *testing.T) {
+	n := strings.Repeat("a", 247) + "é" // 249 bytes; the cut falls inside the rune
+	got := SanitizeName(n)
+	if len(got) != 247 || !utf8.ValidString(got) {
+		t.Fatalf("len %d valid %v", len(got), utf8.ValidString(got))
+	}
+	if got := SanitizeName(strings.Repeat("b", 300)); len(got) != 248 {
+		t.Fatalf("len %d", len(got))
 	}
 }

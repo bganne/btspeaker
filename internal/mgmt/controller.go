@@ -580,6 +580,31 @@ func (c *Controller) pick(cl *Client) (uint16, Info, error) {
 }
 
 // initAdapter runs the startup sequence.
+// storedKeys returns the valid stored link keys, as sent to Load Link Keys.
+func (c *Controller) storedKeys() []Key {
+	var keys []Key
+	for _, d := range c.cfg.Store.Devices() {
+		if d.LinkKey == nil {
+			continue
+		}
+		a, err := bt.ParseAddr(d.Addr)
+		if err != nil {
+			continue
+		}
+		v, err := d.LinkKey.Bytes()
+		if err != nil {
+			c.log.Warn("skipping bad stored key", "addr", d.Addr)
+			continue
+		}
+		if d.LinkKey.Type > maxLinkKeyType {
+			c.log.Warn("skipping stored key with invalid type", "addr", d.Addr, "type", d.LinkKey.Type)
+			continue
+		}
+		keys = append(keys, Key{Addr: a, Type: d.LinkKey.Type, Value: v, PinLen: d.LinkKey.PinLen})
+	}
+	return keys
+}
+
 func (c *Controller) initAdapter() error {
 	// Held throughout so a concurrent OpenPairing cannot be overwritten by the
 	// bondable/discoverable-off steps (OpenPairing waits, or fails: not present).
@@ -604,26 +629,7 @@ func (c *Controller) initAdapter() error {
 	if name == "" {
 		name = c.cfg.Name
 	}
-	var keys []Key
-	for _, d := range c.cfg.Store.Devices() {
-		if d.LinkKey == nil {
-			continue
-		}
-		a, err := bt.ParseAddr(d.Addr)
-		if err != nil {
-			continue
-		}
-		v, err := d.LinkKey.Bytes()
-		if err != nil {
-			c.log.Warn("skipping bad stored key", "addr", d.Addr)
-			continue
-		}
-		if d.LinkKey.Type > maxLinkKeyType {
-			c.log.Warn("skipping stored key with invalid type", "addr", d.Addr, "type", d.LinkKey.Type)
-			continue
-		}
-		keys = append(keys, Key{Addr: a, Type: d.LinkKey.Type, Value: v, PinLen: d.LinkKey.PinLen})
-	}
+	keys := c.storedKeys()
 
 	type step struct {
 		what     string
@@ -924,11 +930,30 @@ func (c *Controller) onNewLinkKey(p []byte) {
 			c.log.Debug("pairing refused: window closed, revoking key", "addr", n.Key.Addr.String())
 		}
 		c.mu.Lock()
+		wasLoaded := c.loaded[n.Key.Addr]
 		delete(c.loaded, n.Key.Addr) // the kernel key is revoked below
 		delete(c.session, n.Key.Addr)
 		c.mu.Unlock()
 		if _, err := c.cmd(OpUnpairDevice, append(addrParam(n.Key.Addr), 1)); err != nil {
 			c.log.Warn("unpair failed", "addr", n.Key.Addr.String(), "err", err)
+		}
+		// The Unpair removed the kernel's real key if this address is bonded
+		// (a no-bonding re-key replaces it); restore it. Only if the kernel had
+		// it: a key that never loaded must stay unloaded. Load Link Keys
+		// replaces the kernel's whole list, so send all stored keys.
+		if wasLoaded && c.cfg.Store.Has(n.Key.Addr) {
+			keys := c.storedKeys()
+			if _, err := c.cmd(OpLoadLinkKeys, EncodeLoadLinkKeys(keys)); err != nil {
+				c.log.Warn("reload link keys failed", "addr", n.Key.Addr.String(), "err", err)
+			} else {
+				for _, k := range keys {
+					if k.Addr == n.Key.Addr {
+						c.mu.Lock()
+						c.loaded[k.Addr] = true
+						c.mu.Unlock()
+					}
+				}
+			}
 		}
 		return
 	}
@@ -1016,6 +1041,14 @@ func SanitizeName(s string) string {
 		}
 		return r
 	}, s)
+	// Names are at most 248 bytes (the mgmt/HCI limit): cap at a rune boundary.
+	if len(s) > 248 {
+		cut := 248
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
 	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsSpace(r) && r != 0x200C && r != 0x200D }) < 0 {
 		return ""
 	}
