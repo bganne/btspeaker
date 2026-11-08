@@ -88,6 +88,7 @@ type Controller struct {
 	timer    *time.Timer
 	lastErr  string
 	refused  map[bt.Addr]bool // strangers already warned about (bounded)
+	refusedT time.Time        // last time the full refused set was cleared
 	// loaded holds the devices whose key the kernel actually has: loaded at
 	// init or stored from New Link Key. A stored device missing from it (bad
 	// key, failed Load Link Keys) is treated as a stranger by Admit.
@@ -96,6 +97,9 @@ type Controller struct {
 	// window: no key is stored, so they are admitted for that connection only
 	// (cleared on Device Disconnected).
 	session map[bt.Addr]bool
+	// restore: bonded devices whose stored key the kernel dropped or will drop
+	// (a no-bonding re-pair replaced it); reloaded from the store on disconnect.
+	restore map[bt.Addr]bool
 
 	// rfkill is the switch init soft-unblocked (by index and name), re-blocked
 	// at Shutdown; rfkillSet is false if init found it unblocked.
@@ -119,7 +123,7 @@ func New(cfg Config) *Controller {
 	if cfg.PairingTimeout <= 0 {
 		cfg.PairingTimeout = 2 * time.Minute
 	}
-	return &Controller{cfg: cfg, log: cfg.Log, conns: map[bt.Addr]bool{}, names: map[bt.Addr]string{}, pending: map[bt.Addr]string{}, refused: map[bt.Addr]bool{}, loaded: map[bt.Addr]bool{}, session: map[bt.Addr]bool{}}
+	return &Controller{cfg: cfg, log: cfg.Log, conns: map[bt.Addr]bool{}, names: map[bt.Addr]string{}, pending: map[bt.Addr]string{}, refused: map[bt.Addr]bool{}, loaded: map[bt.Addr]bool{}, session: map[bt.Addr]bool{}, restore: map[bt.Addr]bool{}}
 }
 
 // Start opens the mgmt socket and runs the controller in the background until
@@ -211,18 +215,39 @@ func (c *Controller) setClient(cl *Client) {
 }
 
 // firstRefusal reports whether a is refused for the first time (bounded set:
-// strangers must not grow it).
+// strangers must not grow it). A full set is cleared at most every
+// refusedReset, so spoofed addresses cannot re-arm the warnings at will.
 func (c *Controller) firstRefusal(a bt.Addr) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.refused[a] {
 		return false
 	}
-	if len(c.refused) >= 64 {
-		clear(c.refused)
+	if len(c.refused) >= maxRefused {
+		if now := time.Now(); now.Sub(c.refusedT) >= refusedReset {
+			clear(c.refused)
+			c.refusedT = now
+		} else {
+			return false
+		}
 	}
 	c.refused[a] = true
 	return true
+}
+
+const (
+	maxRefused   = 64
+	refusedReset = 10 * time.Minute
+)
+
+// logRefusal warns about a refused pairing request the first time a is seen
+// (see firstRefusal), then logs at Debug: strangers must not flood the log.
+func (c *Controller) logRefusal(msg string, a bt.Addr) {
+	if c.firstRefusal(a) {
+		c.log.Warn(msg, "addr", a.String())
+	} else {
+		c.log.Debug(msg, "addr", a.String())
+	}
 }
 
 func (c *Controller) setErr(format string, a ...any) {
@@ -406,9 +431,19 @@ func (c *Controller) pairingAllowed() bool {
 	return PairingAllowed(time.Now(), c.deadline, c.cfg.AlwaysPairable)
 }
 
+// Errors the web layer maps to 404/409 instead of a generic failure.
+var (
+	ErrUnknownDevice = errors.New("unknown device")
+	ErrNotConnected  = errors.New("device not connected")
+)
+
 // Disconnect drops the connection to addr.
 func (c *Controller) Disconnect(addr bt.Addr) error {
 	_, err := c.cmd(OpDisconnect, addrParam(addr))
+	var se *StatusError
+	if errors.As(err, &se) && se.Status == 5 { // Not Connected
+		return fmt.Errorf("%w: %s", ErrNotConnected, addr)
+	}
 	return err
 }
 
@@ -426,11 +461,14 @@ func (c *Controller) Forget(addr bt.Addr) error {
 		_, err = c.cmd(OpUnpairDevice, append(addrParam(addr), 1))
 	}
 	var se *StatusError
-	failed := err != nil && !(errors.As(err, &se) && se.Status == 6) // Not Paired is fine
+	notPaired := errors.As(err, &se) && se.Status == 6 // Not Paired is fine
+	failed := err != nil && !notPaired
+	known := c.cfg.Store.Has(addr)
 	c.mu.Lock()
 	delete(c.names, addr)
 	delete(c.pending, addr)
 	delete(c.session, addr)
+	delete(c.restore, addr)
 	delete(c.loaded, addr) // fail closed even if the kernel keeps the key
 	c.mu.Unlock()
 	if failed {
@@ -440,6 +478,9 @@ func (c *Controller) Forget(addr bt.Addr) error {
 	}
 	if serr := c.cfg.Store.Remove(addr); serr != nil {
 		return serr
+	}
+	if notPaired && !known {
+		return fmt.Errorf("%w: %s", ErrUnknownDevice, addr)
 	}
 	return nil
 }
@@ -605,6 +646,50 @@ func (c *Controller) storedKeys() []Key {
 	return keys
 }
 
+// loadKeysTolerant retries a failed batch Load Link Keys per key and ends with
+// a load of the accepted ones; the rejected keys are logged. It returns the
+// loaded keys, or an error if even that final load fails. do sends one Load
+// Link Keys command. The batch is tried first unless the caller already
+// did (batchFailed).
+func loadKeysTolerant(do func(params []byte) error, keys []Key, batchFailed bool, log *slog.Logger) ([]Key, error) {
+	if !batchFailed && do(EncodeLoadLinkKeys(keys)) == nil {
+		return keys, nil
+	}
+	var good []Key
+	for _, k := range keys {
+		if err := do(EncodeLoadLinkKeys([]Key{k})); err != nil {
+			log.Warn("kernel rejected stored link key", "addr", k.Addr.String(), "err", err)
+			continue
+		}
+		good = append(good, k)
+	}
+	if err := do(EncodeLoadLinkKeys(good)); err != nil {
+		return nil, err
+	}
+	return good, nil
+}
+
+// reloadKeysLocked restores the stored link keys in the kernel after an
+// Unpair or a flushed non-persistent key removed one (Load Link Keys replaces
+// the kernel's whole list, so all stored keys are sent), admitting every key
+// that loaded. Needs winMu: a concurrent Forget must not interleave between
+// the Store.Has check and the load. Does nothing if addr is no longer stored.
+func (c *Controller) reloadKeysLocked(addr bt.Addr) {
+	if !c.cfg.Store.Has(addr) {
+		return
+	}
+	good, err := loadKeysTolerant(func(p []byte) error { _, e := c.cmd(OpLoadLinkKeys, p); return e }, c.storedKeys(), false, c.log)
+	if err != nil {
+		c.log.Warn("reload link keys failed", "addr", addr.String(), "err", err)
+		return
+	}
+	c.mu.Lock()
+	for _, k := range good {
+		c.loaded[k.Addr] = true
+	}
+	c.mu.Unlock()
+}
+
 func (c *Controller) initAdapter() error {
 	// Held throughout so a concurrent OpenPairing cannot be overwritten by the
 	// bondable/discoverable-off steps (OpenPairing waits, or fails: not present).
@@ -621,6 +706,7 @@ func (c *Controller) initAdapter() error {
 	c.conns = map[bt.Addr]bool{}
 	c.loaded = map[bt.Addr]bool{}
 	c.session = map[bt.Addr]bool{}
+	c.restore = map[bt.Addr]bool{}
 	c.mu.Unlock()
 	c.log.Info("adapter found", "index", idx, "addr", info.Addr.String(), "name", info.Name)
 	c.unblockRfkill(idx)
@@ -695,13 +781,15 @@ func (c *Controller) initAdapter() error {
 		}
 		if _, err := cl.Do(idx, s.op, s.params); err != nil {
 			if s.op == OpLoadLinkKeys {
-				// Don't let bad stored keys keep the speaker dead: retry with none.
-				if _, err2 := cl.Do(idx, s.op, EncodeLoadLinkKeys(nil)); err2 != nil {
+				// Don't let bad stored keys keep the speaker dead: keep those the
+				// kernel accepts (Load Link Keys is all-or-nothing per call).
+				good, err2 := loadKeysTolerant(func(p []byte) error { _, e := cl.Do(idx, s.op, p); return e }, keys, true, c.log)
+				if err2 != nil {
 					return fmt.Errorf("%s: %w", s.what, err2)
 				}
-				c.log.Error("loading stored link keys failed; continuing without them", "err", err)
+				c.log.Error("loading stored link keys failed; continuing with the accepted ones", "err", err, "loaded", len(good), "stored", len(keys))
 				loadErr = fmt.Sprintf("loading stored link keys failed: %v", err)
-				keys = nil
+				keys = good
 				fillLoaded()
 				continue
 			}
@@ -792,19 +880,19 @@ func (c *Controller) handle(ev Event) {
 	case EvUserConfirmReq:
 		addr, _, _, err := DecodeAddrEvent(ev.Params)
 		if err != nil {
-			return
+			return // short, or an LE address
 		}
 		if c.pairingAllowed() {
 			c.log.Info("pairing: confirming", "addr", addr.String())
 			c.reply(OpUserConfirmReply, addrParam(addr))
 		} else {
-			c.log.Warn("pairing refused: window closed", "addr", addr.String())
+			c.logRefusal("pairing refused: window closed", addr)
 			c.reply(OpUserConfirmNeg, addrParam(addr))
 		}
 	case EvPINCodeRequest:
 		addr, _, _, err := DecodeAddrEvent(ev.Params)
 		if err != nil {
-			return
+			return // short, or an LE address
 		}
 		if c.cfg.RefuseLegacyPIN {
 			c.log.Warn("legacy PIN pairing refused by policy", "addr", addr.String())
@@ -813,13 +901,16 @@ func (c *Controller) handle(ev Event) {
 			c.log.Info("pairing: legacy PIN", "addr", addr.String())
 			c.reply(OpPINCodeReply, EncodePINReply(addr, legacyPIN))
 		} else {
-			c.log.Warn("legacy pairing refused: window closed", "addr", addr.String())
+			c.logRefusal("legacy pairing refused: window closed", addr)
 			c.reply(OpPINCodeNegReply, addrParam(addr))
 		}
 	case EvNewLinkKey:
 		c.onNewLinkKey(ev.Params)
 	case EvDeviceConnected:
 		d, err := DecodeDeviceConnected(ev.Params)
+		if errors.Is(err, ErrNotBREDR) {
+			return
+		}
 		if err != nil {
 			c.log.Warn("bad device connected", "err", err)
 			return
@@ -861,7 +952,15 @@ func (c *Controller) handle(ev Event) {
 		if !known {
 			delete(c.names, addr)
 		}
+		restore := c.restore[addr]
+		delete(c.restore, addr)
 		c.mu.Unlock()
+		if restore {
+			// The kernel flushed the real key with the no-bonding one.
+			c.winMu.Lock()
+			c.reloadKeysLocked(addr)
+			c.winMu.Unlock()
+		}
 		reason := -1
 		if len(rest) > 0 {
 			reason = int(rest[0])
@@ -910,6 +1009,9 @@ func (c *Controller) reply(op uint16, params []byte) {
 
 func (c *Controller) onNewLinkKey(p []byte) {
 	n, err := DecodeNewLinkKey(p)
+	if errors.Is(err, ErrNotBREDR) {
+		return
+	}
 	if err != nil {
 		c.log.Warn("bad new link key", "err", err)
 		return
@@ -929,31 +1031,27 @@ func (c *Controller) onNewLinkKey(p []byte) {
 		} else {
 			c.log.Debug("pairing refused: window closed, revoking key", "addr", n.Key.Addr.String())
 		}
+		// winMu: Forget must not remove the device between our Store.Has check
+		// and the reload (that would re-admit a forgotten device). Safe to block
+		// here: command replies come from the reader, not the event goroutine.
+		c.winMu.Lock()
+		defer c.winMu.Unlock()
 		c.mu.Lock()
 		wasLoaded := c.loaded[n.Key.Addr]
-		delete(c.loaded, n.Key.Addr) // the kernel key is revoked below
+		wasRestore := c.restore[n.Key.Addr] // stored key flushed by an earlier no-bonding re-key
+		delete(c.loaded, n.Key.Addr)        // the kernel key is revoked below
 		delete(c.session, n.Key.Addr)
+		delete(c.restore, n.Key.Addr)
 		c.mu.Unlock()
 		if _, err := c.cmd(OpUnpairDevice, append(addrParam(n.Key.Addr), 1)); err != nil {
 			c.log.Warn("unpair failed", "addr", n.Key.Addr.String(), "err", err)
 		}
 		// The Unpair removed the kernel's real key if this address is bonded
 		// (a no-bonding re-key replaces it); restore it. Only if the kernel had
-		// it: a key that never loaded must stay unloaded. Load Link Keys
-		// replaces the kernel's whole list, so send all stored keys.
-		if wasLoaded && c.cfg.Store.Has(n.Key.Addr) {
-			keys := c.storedKeys()
-			if _, err := c.cmd(OpLoadLinkKeys, EncodeLoadLinkKeys(keys)); err != nil {
-				c.log.Warn("reload link keys failed", "addr", n.Key.Addr.String(), "err", err)
-			} else {
-				for _, k := range keys {
-					if k.Addr == n.Key.Addr {
-						c.mu.Lock()
-						c.loaded[k.Addr] = true
-						c.mu.Unlock()
-					}
-				}
-			}
+		// it (or would after a pending restore): a key that never loaded must
+		// stay unloaded.
+		if wasLoaded || wasRestore {
+			c.reloadKeysLocked(n.Key.Addr)
 		}
 		return
 	}
@@ -976,6 +1074,14 @@ func (c *Controller) onNewLinkKey(p []byte) {
 		c.loaded[n.Key.Addr] = true
 	} else {
 		c.session[n.Key.Addr] = true
+		// The kernel replaces a bonded device's key in place and flushes a
+		// non-persistent one on disconnect (hci_add_link_key,
+		// HCI_CONN_FLUSH_KEY): the stored key is gone from the kernel until
+		// reloaded after the disconnect. Meanwhile do not treat it as loaded.
+		if c.loaded[n.Key.Addr] && c.cfg.Store.Has(n.Key.Addr) {
+			delete(c.loaded, n.Key.Addr)
+			c.restore[n.Key.Addr] = true
+		}
 	}
 	if closeWin {
 		// Shut the Admit/pairingAllowed gate now, not when the goroutine runs.
@@ -1002,7 +1108,7 @@ func (c *Controller) onNewLinkKey(p []byte) {
 		for _, old := range c.cfg.Store.EvictOldest(n.Key.Addr, store.MaxDevices) {
 			c.log.Warn("device limit reached: forgetting least recently seen device", "addr", old.String())
 			c.setErr("device limit reached: forgot %s", old)
-			if err := c.Forget(old); err != nil {
+			if err := c.Forget(old); err != nil && !errors.Is(err, ErrUnknownDevice) {
 				// EvictOldest already dropped the store entry, so this fails closed.
 				c.log.Error("evict device: unpair failed, key may linger in the kernel until restart", "addr", old.String(), "err", err)
 			}
@@ -1035,7 +1141,7 @@ func ValidName(name string) (string, error) {
 // so callers fall back to the address instead of showing a blank name.
 func SanitizeName(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || unicode.IsControl(r) ||
+		if r == utf8.RuneError || r == 0x2028 || r == 0x2029 || unicode.IsControl(r) ||
 			(unicode.Is(unicode.Cf, r) && r != 0x200C && r != 0x200D) { // Cf: bidi overrides etc.; keep ZWNJ/ZWJ
 			return -1
 		}

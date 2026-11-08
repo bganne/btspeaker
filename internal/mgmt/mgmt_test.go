@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -753,11 +754,11 @@ func TestUnloadedKnownDeviceNotAdmitted(t *testing.T) {
 		t.Fatal("stored device with an unloaded key admitted with the window closed")
 	}
 
-	// Load Link Keys fails: the retry loads none, so no stored device is admitted.
+	// Load Link Keys fails (batch, then the single key): none loads, so no stored device is admitted.
 	dir2 := t.TempDir()
 	seedKey(t, dir2, failed, 4)
 	fake, conn := newFake(t)
-	fake.once = map[uint16]int{OpLoadLinkKeys: 1}
+	fake.once = map[uint16]int{OpLoadLinkKeys: 2}
 	st2, err := store.Open(dir2)
 	if err != nil {
 		t.Fatal(err)
@@ -1074,5 +1075,151 @@ func TestSanitizeNameCaps248(t *testing.T) {
 	}
 	if got := SanitizeName(strings.Repeat("b", 300)); len(got) != 248 {
 		t.Fatalf("len %d", len(got))
+	}
+}
+
+func TestLoadLinkKeysPerKeyRetry(t *testing.T) {
+	a, b := bt.Addr{0xA0, 1}, bt.Addr{0xA0, 2}
+	dir := t.TempDir()
+	seedKey(t, dir, a, 4)
+	seedKey(t, dir, b, 4)
+	fake, conn := newFake(t)
+	// The batch and the first single key are rejected; the second key loads.
+	fake.once = map[uint16]int{OpLoadLinkKeys: 2}
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(Config{Name: "Test", Store: st, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Open: func() (io.ReadWriteCloser, error) { return conn, nil }})
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Shutdown)
+	waitFor(t, "ready", func() bool { return c.Status().Present && fake.count(OpGetConnections) == 1 })
+	if n := fake.count(OpLoadLinkKeys); n != 4 {
+		t.Fatalf("%d load commands, want 4 (batch, 2 singles, final)", n)
+	}
+	if p := fake.lastParams(OpLoadLinkKeys); len(p) != 3+25 {
+		t.Fatalf("final load %d bytes, want one key", len(p))
+	}
+	if c.Admit(a) == c.Admit(b) {
+		t.Fatalf("exactly one key should be admitted: a=%v b=%v", c.Admit(a), c.Admit(b))
+	}
+}
+
+func TestRevokeReloadSerialisedWithForget(t *testing.T) {
+	known := bt.Addr{0xA0, 1, 2, 3, 4, 5}
+	dir := t.TempDir()
+	seedKey(t, dir, known, 8)
+	fake, c, st := startFakeDir(t, false, dir)
+	var once sync.Once
+	fake.mu.Lock()
+	fake.onOp = func(op uint16) {
+		if op != OpUnpairDevice {
+			return
+		}
+		// Forget lands while the revoke path is between Unpair and reload.
+		once.Do(func() {
+			go c.Forget(known)
+			time.Sleep(50 * time.Millisecond)
+		})
+	}
+	fake.mu.Unlock()
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(known, false))
+	waitFor(t, "forget", func() bool { return !st.Has(known) && fake.count(OpUnpairDevice) == 2 })
+	time.Sleep(50 * time.Millisecond)
+	if c.isLoaded(known) || c.Admit(known) {
+		t.Fatal("forgotten device re-admitted by the key reload")
+	}
+}
+
+func TestNoBondingRepairOfBondedDeviceRestoresKey(t *testing.T) {
+	known := bt.Addr{0xA0, 1, 2, 3, 4, 5}
+	dir := t.TempDir()
+	seedKey(t, dir, known, 8)
+	fake, c, _ := startFakeDir(t, false, dir)
+	if err := c.OpenPairing(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(known, false))
+	waitFor(t, "unloaded", func() bool { return !c.isLoaded(known) })
+	if !c.Admit(known) {
+		t.Fatal("session device not admitted")
+	}
+	if fake.count(OpUnpairDevice) != 0 {
+		t.Fatal("in-window key must not be revoked")
+	}
+	before := fake.count(OpLoadLinkKeys)
+	fake.event(EvDeviceDisconn, 0, append(addrParam(known), 0))
+	waitFor(t, "reload", func() bool { return fake.count(OpLoadLinkKeys) == before+1 })
+	waitFor(t, "loaded", func() bool { return c.isLoaded(known) })
+}
+
+// A no-bonding re-key after the window closed must still restore the stored
+// key that an earlier in-window no-bonding re-pair flushed from the kernel.
+func TestRevokeAfterNoBondingRepairRestoresKey(t *testing.T) {
+	known := bt.Addr{0xA0, 1, 2, 3, 4, 5}
+	dir := t.TempDir()
+	seedKey(t, dir, known, 8)
+	fake, c, _ := startFakeDir(t, false, dir)
+	if err := c.OpenPairing(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(known, false))
+	waitFor(t, "unloaded", func() bool { return !c.isLoaded(known) })
+	if err := c.ClosePairing(); err != nil {
+		t.Fatal(err)
+	}
+	before := fake.count(OpLoadLinkKeys)
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(known, false))
+	waitFor(t, "unpair", func() bool { return fake.count(OpUnpairDevice) == 1 })
+	waitFor(t, "reload", func() bool { return fake.count(OpLoadLinkKeys) == before+1 })
+	if p := fake.lastParams(OpLoadLinkKeys); len(p) != 3+25 || !bytes.Equal(p[3:9], addrParam(known)[:6]) {
+		t.Fatalf("reload params %x, want the stored key", p)
+	}
+	waitFor(t, "loaded", func() bool { return c.isLoaded(known) })
+}
+
+func TestLEAddressEventsIgnored(t *testing.T) {
+	p := addrParam(bt.Addr{1})
+	p[6] = 1 // LE public
+	if _, _, _, err := DecodeAddrEvent(p); !errors.Is(err, ErrNotBREDR) {
+		t.Fatalf("err %v", err)
+	}
+	nk := newLinkKeyEvent(bt.Addr{1}, true)
+	nk[7] = 2
+	if _, err := DecodeNewLinkKey(nk); !errors.Is(err, ErrNotBREDR) {
+		t.Fatalf("err %v", err)
+	}
+	dc := append(append([]byte(nil), p...), 0, 0, 0, 0, 0, 0)
+	if _, err := DecodeDeviceConnected(dc); !errors.Is(err, ErrNotBREDR) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestFirstRefusalFullSetNotRearmed(t *testing.T) {
+	_, c, _ := startFake(t, false)
+	for i := range maxRefused {
+		if !c.firstRefusal(bt.Addr{0xD0, byte(i)}) {
+			t.Fatalf("addr %d: want first refusal", i)
+		}
+	}
+	// Full and cleared recently (refusedT zero means never: the first fill
+	// clears once), so a flood of new addresses must not re-arm warnings.
+	if !c.firstRefusal(bt.Addr{0xD1}) {
+		t.Fatal("first overflow clears the set")
+	}
+	for i := 1; i < maxRefused; i++ {
+		c.firstRefusal(bt.Addr{0xD2, byte(i)})
+	}
+	if c.firstRefusal(bt.Addr{0xD3}) || c.firstRefusal(bt.Addr{0xD0, 0}) {
+		t.Fatal("full set re-armed before refusedReset")
+	}
+	c.mu.Lock()
+	c.refusedT = time.Now().Add(-refusedReset)
+	c.mu.Unlock()
+	if !c.firstRefusal(bt.Addr{0xD3}) {
+		t.Fatal("set not cleared after refusedReset")
 	}
 }

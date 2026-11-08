@@ -287,6 +287,9 @@ func DecodeNewLinkKey(p []byte) (NewLinkKey, error) {
 		return NewLinkKey{}, errors.New("mgmt: short new link key")
 	}
 	var n NewLinkKey
+	if p[7] != AddrBREDR {
+		return NewLinkKey{}, ErrNotBREDR
+	}
 	n.StoreHint = p[0] != 0
 	n.Key.Addr = addrFromWire(p[1:7])
 	n.Key.Type = p[8]
@@ -294,6 +297,11 @@ func DecodeNewLinkKey(p []byte) (NewLinkKey, error) {
 	n.Key.PinLen = p[25]
 	return n, nil
 }
+
+// ErrNotBREDR is returned when decoding a device event for an LE address:
+// only BR/EDR peers matter here, and an LE random address can collide with a
+// BR/EDR one.
+var ErrNotBREDR = errors.New("mgmt: not a BR/EDR address")
 
 // DeviceConnected is the Device Connected event.
 type DeviceConnected struct {
@@ -306,6 +314,9 @@ type DeviceConnected struct {
 func DecodeDeviceConnected(p []byte) (DeviceConnected, error) {
 	if len(p) < 7+4+2 {
 		return DeviceConnected{}, errors.New("mgmt: short device connected")
+	}
+	if p[6] != AddrBREDR {
+		return DeviceConnected{}, ErrNotBREDR
 	}
 	d := DeviceConnected{Addr: addrFromWire(p[0:6]), Flags: binary.LittleEndian.Uint32(p[7:])}
 	n := int(binary.LittleEndian.Uint16(p[11:]))
@@ -341,6 +352,9 @@ func EIRName(eir []byte) string {
 func DecodeAddrEvent(p []byte) (addr bt.Addr, addrType uint8, rest []byte, err error) {
 	if len(p) < 7 {
 		return addr, 0, nil, errors.New("mgmt: short address event")
+	}
+	if p[6] != AddrBREDR {
+		return addr, p[6], nil, ErrNotBREDR
 	}
 	return addrFromWire(p[0:6]), p[6], p[7:], nil
 }
