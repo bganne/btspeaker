@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,8 +132,14 @@ func Open(dir string) (*Store, error) {
 
 // sameBackup returns an existing backup whose content is b, or "".
 func (s *Store) sameBackup(b []byte) string {
-	ms, _ := filepath.Glob(s.path + ".corrupt*")
-	for _, m := range ms {
+	// Not filepath.Glob: the state path may contain glob metacharacters.
+	dir, base := filepath.Split(s.path)
+	es, _ := os.ReadDir(filepath.Clean(dir))
+	for _, e := range es {
+		if !e.Type().IsRegular() || !strings.HasPrefix(e.Name(), base+".corrupt") {
+			continue
+		}
+		m := filepath.Join(dir, e.Name())
 		if old, err := os.ReadFile(m); err == nil && bytes.Equal(old, b) {
 			return m
 		}

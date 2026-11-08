@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -285,6 +286,32 @@ func TestOpenNormalisesAddresses(t *testing.T) {
 	}
 	if ms, _ := filepath.Glob(filepath.Join(dir, "state.json.corrupt*")); len(ms) != 1 {
 		t.Errorf("backups = %v", ms)
+	}
+}
+
+func TestBackupDedupGlobMetachars(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "st[a*?")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	js := `{"devices":[{"addr":"junk"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(js), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := Open(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	es, _ := os.ReadDir(dir)
+	n := 0
+	for _, e := range es {
+		if strings.HasPrefix(e.Name(), "state.json.corrupt") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("backups = %d, want 1", n)
 	}
 }
 
