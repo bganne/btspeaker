@@ -3,6 +3,7 @@ package web
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
@@ -312,7 +313,7 @@ func basicAuth(cfg Config, next http.Handler) http.Handler {
 	if user == "" {
 		user = "admin"
 	}
-	wantU, wantP := []byte(user), []byte(cfg.Password)
+	wantU, wantP := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(cfg.Password))
 	lim := newFailLimiter()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A request without credentials (the browser's first visit) costs nothing and
@@ -329,8 +330,10 @@ func basicAuth(cfg Config, next http.Handler) http.Handler {
 		}
 		u, p, ok := r.BasicAuth()
 		// Evaluate both comparisons unconditionally.
-		okU := subtle.ConstantTimeCompare([]byte(u), wantU)
-		okP := subtle.ConstantTimeCompare([]byte(p), wantP)
+		// Compare fixed-length digests so the length of the secrets does not leak.
+		hu, hp := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
+		okU := subtle.ConstantTimeCompare(hu[:], wantU[:])
+		okP := subtle.ConstantTimeCompare(hp[:], wantP[:])
 		if !ok || okU&okP != 1 {
 			lim.fail(r.RemoteAddr)
 			time.Sleep(authFailDelay)
