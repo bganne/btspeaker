@@ -620,6 +620,9 @@ func (p *PCM) Write(buf []byte) error {
 				p.afterXrun(buf)
 			}
 		case unix.ESTRPIPE: // suspended
+			if recoveries++; recoveries > maxXrunRecoveries {
+				return errors.New("alsa: write: repeated suspends")
+			}
 			if err := p.resume(); err != nil {
 				return err
 			}
