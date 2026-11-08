@@ -101,6 +101,22 @@ func TestEndpoints(t *testing.T) {
 	if w := form(h, "/ui/devices/11:22:33:44:55:66/disconnect", ""); !strings.Contains(w.Header().Get("Location"), "msg=not_connected") {
 		t.Fatalf("ui flash %q", w.Header().Get("Location"))
 	}
+	f.err = errors.Join(mgmt.ErrNoAdapter, errors.New("y"))
+	for _, path := range []string{"/api/pairing", "/api/name"} {
+		body := ``
+		if path == "/api/name" {
+			body = `{"name":"x"}`
+		}
+		if w := do(h, "POST", path, body); w.Code != 503 {
+			t.Fatalf("%s without adapter %d", path, w.Code)
+		}
+	}
+	if w := do(h, "DELETE", "/api/pairing", ``); w.Code != 503 {
+		t.Fatalf("close pairing without adapter %d", w.Code)
+	}
+	if w := form(h, "/ui/pairing/open", ""); !strings.Contains(w.Header().Get("Location"), "msg=no_adapter") {
+		t.Fatalf("ui flash %q", w.Header().Get("Location"))
+	}
 	f.err = errors.New("boom")
 	if w := do(h, "POST", "/api/pairing", ``); w.Code != 500 || strings.Contains(w.Body.String(), "boom") || !strings.Contains(w.Body.String(), "action failed") {
 		t.Fatalf("backend error %d", w.Code)

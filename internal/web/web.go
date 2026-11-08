@@ -369,7 +369,7 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 
 // writeActionErr answers a failed device action: unknown device is 404, a
 // device that is not connected 409 (client errors, not logged as failures),
-// anything else 500.
+// an absent adapter 503, anything else 500.
 func writeActionErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, mgmt.ErrUnknownDevice):
@@ -378,6 +378,9 @@ func writeActionErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, mgmt.ErrNotConnected):
 		slog.Info("web: api action rejected", "err", err)
 		writeErr(w, http.StatusConflict, err)
+	case errors.Is(err, mgmt.ErrNoAdapter): // a state, not a failure: no Error log
+		slog.Info("web: api action rejected", "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": mgmt.ErrNoAdapter.Error()})
 	default:
 		writeErr(w, http.StatusInternalServerError, err)
 	}
@@ -392,6 +395,7 @@ var flashMessages = map[string]string{
 	"unknown":       "Unknown device.",
 	"not_connected": "The device is not connected.",
 	"invalid_name":  "Invalid name (1..248 bytes, no control or bidi format characters).",
+	"no_adapter":    "The Bluetooth adapter is not present.",
 	"failed":        "The action failed; see the service log.",
 }
 
@@ -411,6 +415,8 @@ func flashCode(err error) string {
 		return "unknown"
 	case errors.Is(err, mgmt.ErrNotConnected):
 		return "not_connected"
+	case errors.Is(err, mgmt.ErrNoAdapter):
+		return "no_adapter"
 	}
 	return "failed"
 }
@@ -500,7 +506,7 @@ func (s *server) openPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.b.OpenPairing(time.Duration(req.Seconds) * time.Second); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeActionErr(w, err)
 		return
 	}
 	ok(w)
@@ -508,7 +514,7 @@ func (s *server) openPairing(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) closePairing(w http.ResponseWriter, r *http.Request) {
 	if err := s.b.ClosePairing(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeActionErr(w, err)
 		return
 	}
 	ok(w)
@@ -554,7 +560,7 @@ func (s *server) setName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.b.SetName(name); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeActionErr(w, err)
 		return
 	}
 	ok(w)
