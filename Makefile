@@ -1,4 +1,4 @@
-.PHONY: build arm test vet bench-arm
+.PHONY: build arm test test-race vet bench-arm
 
 build:
 	go build -o btspeaker .
@@ -10,6 +10,10 @@ arm:
 
 test: vet
 	go test ./...
+
+# -race needs cgo (gcc) on the host.
+test-race: vet
+	go test -race ./...
 
 vet:
 	go vet ./...
