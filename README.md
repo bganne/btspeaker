@@ -52,13 +52,13 @@ below 0x1001: SDP, AVCTP, AVDTP). State (link keys, names) is in
 | `-adapter` | first | `hciN` or MAC |
 | `-name` | host's FQDN | speaker name (default: hostname qualified from `/etc/hosts` or the resolv.conf domain/search, no DNS); a name set via the UI/API is persisted and wins |
 | `-alsa-device` | `hw:0,0` | `hw:CARD,DEV` only (no plug/dmix) |
-| `-buffer` | `200ms` | ALSA buffer |
+| `-buffer` | `200ms` | ALSA buffer, `20ms`..`2s` |
 | `-idle-release` | `5s` | release the device after this much digital silence |
 | `-spdif-preroll` | `200ms` | zeros played after each (re)open so an S/PDIF receiver can relock before audio starts; `0` = off; must not exceed `-buffer` |
 | `-pairing-timeout` | `1m` | default pairing window |
 | `-always-pairable` | off | permanently discoverable and accepting pairing: open Just Works pairing, anyone in range can pair (insecure) |
 | `-no-legacy-pin` | off | refuse legacy PIN pairing instead of answering `0000` (sniffable) |
-| `-sbc-max-bitpool` | `76` | max SBC bitpool advertised: `53` = standard high quality, `76`+ = SBC XQ (the source picks the actual value) |
+| `-sbc-max-bitpool` | `76` | max SBC bitpool advertised: `53` = standard high quality, `76`+ = SBC XQ (the source picks the actual value); `2`..`250` |
 | `-volume` | `software` | `software` applies AVRCP volume as gain, `off` is bit-perfect |
 | `-state-dir` | `/var/lib/btspeaker` | |
 | `-listen` | `:8099` | web UI / API |
@@ -80,6 +80,10 @@ The window is enforced by btspeaker itself, not just by discoverability (the ker
 Works pairing for a speaker with no display or buttons): outside the window the adapter is not
 bondable, a link key from an unknown device is discarded and revoked, and AVDTP/AVRCP connections
 from unpaired devices are refused. SDP stays open to everyone.
+
+Only bonded devices are remembered. A source that pairs without bonding gets a session key that
+the kernel drops whenever btspeaker reloads the stored keys (adapter re-init, or restoring a bonded
+device's key); that source then has to pair again inside a window.
 
 On shutdown btspeaker turns discoverable and bondable off. If that cannot complete (the process is
 killed, or an adapter init holds things up for more than 2 s), the adapter can stay discoverable and
