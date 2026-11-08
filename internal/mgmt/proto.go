@@ -76,7 +76,7 @@ const (
 // Address types.
 const AddrBREDR = 0
 
-// Status is a mgmt status code (0 = success).
+// StatusCode is a mgmt status code (0 = success).
 type StatusCode uint8
 
 var statusNames = [...]string{"Success", "Unknown Command", "Not Connected", "Failed", "Connect Failed",

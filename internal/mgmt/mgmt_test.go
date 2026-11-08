@@ -1223,3 +1223,12 @@ func TestFirstRefusalFullSetNotRearmed(t *testing.T) {
 		t.Fatal("set not cleared after refusedReset")
 	}
 }
+
+func TestInitBackoff(t *testing.T) {
+	want := []time.Duration{0, 5, 10, 20, 40, 60, 60, 60}
+	for n, w := range want {
+		if got := initBackoff(n); got != w*time.Second {
+			t.Errorf("initBackoff(%d) = %v, want %v", n, got, w*time.Second)
+		}
+	}
+}

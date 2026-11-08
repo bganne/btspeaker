@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"btspeaker/internal/bt"
 	"btspeaker/internal/hci"
@@ -105,6 +103,11 @@ type Controller struct {
 	// at Shutdown; rfkillSet is false if init found it unblocked.
 	rfkill    rfkillSwitch
 	rfkillSet bool
+
+	// Init retry backoff; only touched from the serve goroutine.
+	initFails   int       // consecutive failed inits
+	initErr     string    // text of the last init failure
+	initNextTry time.Time // earliest next retry
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -541,7 +544,7 @@ func (c *Controller) serve(ctx context.Context, cl *Client) {
 		case <-ctx.Done():
 			return
 		case <-retry.C:
-			if !c.isPresent() {
+			if !c.isPresent() && !time.Now().Before(c.initNextTry) {
 				c.tryInit()
 			}
 		case ev, ok := <-cl.Events():
@@ -559,14 +562,45 @@ func (c *Controller) isPresent() bool {
 	return c.present
 }
 
-func (c *Controller) tryInit() {
-	if err := c.initAdapter(); err != nil {
-		c.log.Error("adapter init failed", "err", err)
-		c.setErr("adapter init: %v", err)
-		c.mu.Lock()
-		c.present = false
-		c.mu.Unlock()
+// initBackoff is the delay before retrying after fails consecutive failed
+// inits: 5, 10, 20, 40 s, then 60 s. Each retry power-cycles the dongle.
+func initBackoff(fails int) time.Duration {
+	if fails < 1 {
+		return 0
 	}
+	if fails > 4 {
+		return maxInitBackoff
+	}
+	return min(retryInterval<<(fails-1), maxInitBackoff)
+}
+
+const maxInitBackoff = 60 * time.Second
+
+// resetInitBackoff forgets earlier init failures (success or a new controller).
+func (c *Controller) resetInitBackoff() {
+	c.initFails = 0
+	c.initErr = ""
+	c.initNextTry = time.Time{}
+}
+
+func (c *Controller) tryInit() {
+	err := c.initAdapter()
+	if err == nil {
+		c.resetInitBackoff()
+		return
+	}
+	c.initFails++
+	c.initNextTry = time.Now().Add(initBackoff(c.initFails))
+	if msg := err.Error(); msg != c.initErr {
+		c.initErr = msg
+		c.log.Error("adapter init failed", "err", err)
+	} else {
+		c.log.Debug("adapter init failed", "err", err, "attempt", c.initFails)
+	}
+	c.setErr("adapter init: %v", err)
+	c.mu.Lock()
+	c.present = false
+	c.mu.Unlock()
 }
 
 // pick selects the controller index per Config.Adapter.
@@ -621,75 +655,6 @@ func (c *Controller) pick(cl *Client) (uint16, Info, error) {
 }
 
 // initAdapter runs the startup sequence.
-// storedKeys returns the valid stored link keys, as sent to Load Link Keys.
-func (c *Controller) storedKeys() []Key {
-	var keys []Key
-	for _, d := range c.cfg.Store.Devices() {
-		if d.LinkKey == nil {
-			continue
-		}
-		a, err := bt.ParseAddr(d.Addr)
-		if err != nil {
-			continue
-		}
-		v, err := d.LinkKey.Bytes()
-		if err != nil {
-			c.log.Warn("skipping bad stored key", "addr", d.Addr)
-			continue
-		}
-		if d.LinkKey.Type > maxLinkKeyType {
-			c.log.Warn("skipping stored key with invalid type", "addr", d.Addr, "type", d.LinkKey.Type)
-			continue
-		}
-		keys = append(keys, Key{Addr: a, Type: d.LinkKey.Type, Value: v, PinLen: d.LinkKey.PinLen})
-	}
-	return keys
-}
-
-// loadKeysTolerant retries a failed batch Load Link Keys per key and ends with
-// a load of the accepted ones; the rejected keys are logged. It returns the
-// loaded keys, or an error if even that final load fails. do sends one Load
-// Link Keys command. The batch is tried first unless the caller already
-// did (batchFailed).
-func loadKeysTolerant(do func(params []byte) error, keys []Key, batchFailed bool, log *slog.Logger) ([]Key, error) {
-	if !batchFailed && do(EncodeLoadLinkKeys(keys)) == nil {
-		return keys, nil
-	}
-	var good []Key
-	for _, k := range keys {
-		if err := do(EncodeLoadLinkKeys([]Key{k})); err != nil {
-			log.Warn("kernel rejected stored link key", "addr", k.Addr.String(), "err", err)
-			continue
-		}
-		good = append(good, k)
-	}
-	if err := do(EncodeLoadLinkKeys(good)); err != nil {
-		return nil, err
-	}
-	return good, nil
-}
-
-// reloadKeysLocked restores the stored link keys in the kernel after an
-// Unpair or a flushed non-persistent key removed one (Load Link Keys replaces
-// the kernel's whole list, so all stored keys are sent), admitting every key
-// that loaded. Needs winMu: a concurrent Forget must not interleave between
-// the Store.Has check and the load. Does nothing if addr is no longer stored.
-func (c *Controller) reloadKeysLocked(addr bt.Addr) {
-	if !c.cfg.Store.Has(addr) {
-		return
-	}
-	good, err := loadKeysTolerant(func(p []byte) error { _, e := c.cmd(OpLoadLinkKeys, p); return e }, c.storedKeys(), false, c.log)
-	if err != nil {
-		c.log.Warn("reload link keys failed", "addr", addr.String(), "err", err)
-		return
-	}
-	c.mu.Lock()
-	for _, k := range good {
-		c.loaded[k.Addr] = true
-	}
-	c.mu.Unlock()
-}
-
 func (c *Controller) initAdapter() error {
 	// Held throughout so a concurrent OpenPairing cannot be overwritten by the
 	// bondable/discoverable-off steps (OpenPairing waits, or fails: not present).
@@ -837,6 +802,7 @@ func (c *Controller) handle(ev Event) {
 	case EvIndexAdded:
 		if !c.isPresent() {
 			c.log.Info("controller added", "index", ev.Index)
+			c.resetInitBackoff()
 			c.tryInit()
 		}
 		return
@@ -895,7 +861,7 @@ func (c *Controller) handle(ev Event) {
 			return // short, or an LE address
 		}
 		if c.cfg.RefuseLegacyPIN {
-			c.log.Warn("legacy PIN pairing refused by policy", "addr", addr.String())
+			c.logRefusal("legacy PIN pairing refused by policy", addr)
 			c.reply(OpPINCodeNegReply, addrParam(addr))
 		} else if c.pairingAllowed() {
 			c.log.Info("pairing: legacy PIN", "addr", addr.String())
@@ -965,16 +931,22 @@ func (c *Controller) handle(ev Event) {
 		if len(rest) > 0 {
 			reason = int(rest[0])
 		}
-		c.log.Info("device disconnected", "addr", addr.String(), "reason", reason)
+		lvl := slog.LevelInfo
+		if !known {
+			lvl = slog.LevelDebug // strangers: keep the log quiet
+		}
+		c.log.Log(context.Background(), lvl, "device disconnected", "addr", addr.String(), "reason", reason)
 	case EvAuthFailed:
 		addr, _, rest, err := DecodeAddrEvent(ev.Params)
 		if err != nil {
 			return
 		}
 		st := Status0(rest)
-		c.log.Warn("authentication failed", "addr", addr.String(), "status", st)
-		if c.cfg.Store.Has(addr) { // strangers must not overwrite the UI error
+		if c.cfg.Store.Has(addr) { // strangers must not overwrite the UI error or flood the log
+			c.log.Warn("authentication failed", "addr", addr.String(), "status", st)
 			c.setErr("authentication with %s failed: %s", addr, st)
+		} else {
+			c.log.Debug("authentication failed", "addr", addr.String(), "status", st)
 		}
 	case EvConnectFailed:
 		addr, _, rest, err := DecodeAddrEvent(ev.Params)
@@ -1031,30 +1003,43 @@ func (c *Controller) onNewLinkKey(p []byte) {
 		} else {
 			c.log.Debug("pairing refused: window closed, revoking key", "addr", n.Key.Addr.String())
 		}
-		// winMu: Forget must not remove the device between our Store.Has check
-		// and the reload (that would re-admit a forgotten device). Safe to block
-		// here: command replies come from the reader, not the event goroutine.
-		c.winMu.Lock()
-		defer c.winMu.Unlock()
-		c.mu.Lock()
-		wasLoaded := c.loaded[n.Key.Addr]
-		wasRestore := c.restore[n.Key.Addr] // stored key flushed by an earlier no-bonding re-key
-		delete(c.loaded, n.Key.Addr)        // the kernel key is revoked below
-		delete(c.session, n.Key.Addr)
-		delete(c.restore, n.Key.Addr)
-		c.mu.Unlock()
-		if _, err := c.cmd(OpUnpairDevice, append(addrParam(n.Key.Addr), 1)); err != nil {
-			c.log.Warn("unpair failed", "addr", n.Key.Addr.String(), "err", err)
-		}
-		// The Unpair removed the kernel's real key if this address is bonded
-		// (a no-bonding re-key replaces it); restore it. Only if the kernel had
-		// it (or would after a pending restore): a key that never loaded must
-		// stay unloaded.
-		if wasLoaded || wasRestore {
-			c.reloadKeysLocked(n.Key.Addr)
-		}
+		c.revokeKey(n.Key.Addr)
 		return
 	}
+	c.acceptKey(n, isNew)
+}
+
+// revokeKey drops the kernel key of addr after a refused pairing and restores
+// the stored one if the kernel had it. Takes winMu itself (so mu must not be
+// held): Forget must not remove the device between the Store.Has check and
+// the reload (that would re-admit a forgotten device). Safe to block here:
+// command replies come from the reader, not the event goroutine.
+func (c *Controller) revokeKey(addr bt.Addr) {
+	c.winMu.Lock()
+	defer c.winMu.Unlock()
+	c.mu.Lock()
+	wasLoaded := c.loaded[addr]
+	wasRestore := c.restore[addr] // stored key flushed by an earlier no-bonding re-key
+	delete(c.loaded, addr)        // the kernel key is revoked below
+	delete(c.session, addr)
+	delete(c.restore, addr)
+	c.mu.Unlock()
+	if _, err := c.cmd(OpUnpairDevice, append(addrParam(addr), 1)); err != nil {
+		c.log.Warn("unpair failed", "addr", addr.String(), "err", err)
+	}
+	// The Unpair removed the kernel's real key if this address is bonded
+	// (a no-bonding re-key replaces it); restore it. Only if the kernel had
+	// it (or would after a pending restore): a key that never loaded must
+	// stay unloaded.
+	if wasLoaded || wasRestore {
+		c.reloadKeysLocked(addr)
+	}
+}
+
+// acceptKey admits and persists a key onNewLinkKey let through. Neither winMu
+// nor mu may be held on entry: it takes mu briefly, then (via ClosePairing and
+// Forget) winMu, never both nested.
+func (c *Controller) acceptKey(n NewLinkKey, isNew bool) {
 	c.mu.Lock()
 	if p, ok := c.pending[n.Key.Addr]; ok { // a fresh key proves the peer authenticated
 		c.names[n.Key.Addr] = p
@@ -1118,45 +1103,3 @@ func (c *Controller) onNewLinkKey(p []byte) {
 
 // maxNames caps the remembered remote names.
 const maxNames = 64
-
-// maxLinkKeyType is the highest key type the kernel accepts in Load Link Keys.
-const maxLinkKeyType = 8
-
-// ErrInvalidName is returned by ValidName.
-var ErrInvalidName = errors.New("invalid name (1..248 bytes, no control or bidi format characters)")
-
-// ValidName trims name and checks it is a usable adapter name: 1..248 bytes
-// of valid UTF-8 that SanitizeName leaves unchanged.
-func ValidName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" || len(name) > 248 || !utf8.ValidString(name) || SanitizeName(name) != name {
-		return "", ErrInvalidName
-	}
-	return name, nil
-}
-
-// SanitizeName makes a remote-supplied device name safe for logs and state.json:
-// invalid UTF-8, control and format characters (bidi overrides that can spoof a
-// name in the web UI) are dropped. A name with no visible rune left becomes "",
-// so callers fall back to the address instead of showing a blank name.
-func SanitizeName(s string) string {
-	s = strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || r == 0x2028 || r == 0x2029 || unicode.IsControl(r) ||
-			(unicode.Is(unicode.Cf, r) && r != 0x200C && r != 0x200D) { // Cf: bidi overrides etc.; keep ZWNJ/ZWJ
-			return -1
-		}
-		return r
-	}, s)
-	// Names are at most 248 bytes (the mgmt/HCI limit): cap at a rune boundary.
-	if len(s) > 248 {
-		cut := 248
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		s = s[:cut]
-	}
-	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsSpace(r) && r != 0x200C && r != 0x200D }) < 0 {
-		return ""
-	}
-	return s
-}
