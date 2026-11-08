@@ -131,6 +131,7 @@ type fakeController struct {
 	last        map[uint16][]byte
 	fail        map[uint16]bool // ops answered with a failure status
 	once        map[uint16]int  // ops answered with a failure status this many more times
+	status      map[uint16]byte // ops answered with this status (overrides fail)
 	onOp        func(op uint16) // called (unlocked) before answering, if set
 	current     uint32          // extra current settings reported by Read Info
 	connectable bool            // connectable flag; the kernel rejects Set Discoverable without it
@@ -181,6 +182,9 @@ func (f *fakeController) serve() {
 		if f.once[h.Code] > 0 {
 			f.once[h.Code]--
 			status = 0x0c
+		}
+		if st, ok := f.status[h.Code]; ok {
+			status = st
 		}
 		switch h.Code {
 		case OpSetConnectable:
@@ -1274,5 +1278,41 @@ func TestInitBackoff(t *testing.T) {
 		if got := initBackoff(n); got != w*time.Second {
 			t.Errorf("initBackoff(%d) = %v, want %v", n, got, w*time.Second)
 		}
+	}
+}
+
+func TestDisconnectNotConnected(t *testing.T) {
+	fake, c, _ := startFake(t, false)
+	fake.mu.Lock()
+	fake.status = map[uint16]byte{OpDisconnect: byte(StatusNotConnected)}
+	fake.mu.Unlock()
+	if err := c.Disconnect(bt.Addr{0xA0, 1}); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("err = %v, want ErrNotConnected", err)
+	}
+	fake.mu.Lock()
+	fake.status[OpDisconnect] = 0x05 // Authentication Failed
+	fake.mu.Unlock()
+	if err := c.Disconnect(bt.Addr{0xA0, 1}); err == nil || errors.Is(err, ErrNotConnected) {
+		t.Fatalf("err = %v, want a generic failure", err)
+	}
+}
+
+func TestNoBondingSessionRekeyKeepsConnection(t *testing.T) {
+	fake, c, st := startFake(t, false)
+	if err := c.OpenPairing(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	addr := bt.Addr{0xC0, 1, 2, 3, 4, 5}
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(addr, false))
+	waitFor(t, "window closed", func() bool { return !pairingOpen(c) })
+	fake.event(EvNewLinkKey, 0, newLinkKeyEvent(addr, false))
+	// A later event is handled after the re-key: sync on it.
+	fake.event(EvDeviceDisconn, 0, append(addrParam(addr), 0))
+	waitFor(t, "not admitted", func() bool { return !c.Admit(addr) })
+	if n := fake.count(OpUnpairDevice); n != 0 {
+		t.Fatalf("%d unpairs, want 0 for a session re-key", n)
+	}
+	if st.Has(addr) {
+		t.Fatal("session key stored")
 	}
 }

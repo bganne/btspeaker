@@ -413,6 +413,14 @@ func (c *Controller) inSession(addr bt.Addr) bool {
 	return c.session[addr]
 }
 
+// sessionOnly reports a peer admitted for its current connection only, with
+// no stored key behind it (loaded or awaiting restore).
+func (c *Controller) sessionOnly(addr bt.Addr) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session[addr] && !c.loaded[addr] && !c.restore[addr] && !c.cfg.Store.Has(addr)
+}
+
 func (c *Controller) isLoaded(addr bt.Addr) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -455,7 +463,7 @@ var (
 func (c *Controller) Disconnect(addr bt.Addr) error {
 	_, err := c.cmd(OpDisconnect, addrParam(addr))
 	var se *StatusError
-	if errors.As(err, &se) && se.Status == 5 { // Not Connected
+	if errors.As(err, &se) && se.Status == StatusNotConnected {
 		return fmt.Errorf("%w: %s", ErrNotConnected, addr)
 	}
 	return err
@@ -479,7 +487,7 @@ func (c *Controller) Forget(addr bt.Addr) error {
 		_, err = c.cmd(OpUnpairDevice, append(addrParam(addr), 1))
 	}
 	var se *StatusError
-	notPaired := errors.As(err, &se) && se.Status == 6 // Not Paired is fine
+	notPaired := errors.As(err, &se) && se.Status == StatusNotPaired // fine
 	failed := err != nil && !notPaired
 	known := c.cfg.Store.Has(addr)
 	c.mu.Lock()
@@ -1038,6 +1046,13 @@ func (c *Controller) onNewLinkKey(p []byte) {
 	// A no-bonding key (StoreHint false) outside the window is refused even for
 	// a loaded address: a spoofer could otherwise pass the security check with
 	// it. A legitimately bonded device re-keys with StoreHint true.
+	// A no-bonding re-key on the live connection of a session-only peer
+	// (admitted for this connection, cleared on disconnect, no stored key) is
+	// not a new pairing: revoking it would just drop the connection.
+	if !n.StoreHint && c.sessionOnly(n.Key.Addr) {
+		c.acceptKey(n, false)
+		return
+	}
 	isNew := !c.isLoaded(n.Key.Addr)
 	if (isNew || !n.StoreHint) && !c.pairingAllowed() {
 		if c.firstRefusal(n.Key.Addr) {

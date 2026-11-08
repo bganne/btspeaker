@@ -79,6 +79,12 @@ const AddrBREDR = 0
 // StatusCode is a mgmt status code (0 = success).
 type StatusCode uint8
 
+// Status codes matched by name (mgmt-api.txt).
+const (
+	StatusNotConnected StatusCode = 0x02
+	StatusNotPaired    StatusCode = 0x06
+)
+
 var statusNames = [...]string{"Success", "Unknown Command", "Not Connected", "Failed", "Connect Failed",
 	"Authentication Failed", "Not Paired", "No Resources", "Timeout", "Already Connected", "Busy",
 	"Rejected", "Not Supported", "Invalid Parameters", "Disconnected", "Not Powered", "Cancelled",
