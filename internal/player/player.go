@@ -268,6 +268,9 @@ func (p *Player) Write(pcm []int16) {
 		p.putBuf(buf)
 	}
 	if silent && p.silentFor >= p.cfg.IdleRelease {
+		// Only silence is queued: drop it rather than drain, so the device is
+		// freed at once and the start of the next track is not lost.
+		p.abortLocked(s)
 		p.releaseLocked()
 	} else {
 		p.wd.Reset(p.noWrite)

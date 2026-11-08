@@ -206,8 +206,8 @@ func TestIdleSilenceReleaseAndReopen(t *testing.T) {
 		t.Fatal("should release after idle silence")
 	}
 	waitFor(t, "close", pc.isClosed)
-	if !pc.drained {
-		t.Fatal("not drained")
+	if pc.drained || !pc.aborted {
+		t.Fatalf("idle release should drop queued silence: drained=%v aborted=%v", pc.drained, pc.aborted)
 	}
 	p.Write(loud)
 	if !p.Status().Open || b.nOpens() != 2 {
@@ -302,9 +302,10 @@ func TestGainMath(t *testing.T) {
 		t.Fatal("clip16")
 	}
 	o4 := make([]byte, 16)
-	Convert(o4, in, 1, 1, alsa.S32LE, 2*unity)
-	if int32(binary.LittleEndian.Uint32(o4)) != 0x7fffffff || int32(binary.LittleEndian.Uint32(o4[4:])) != -0x80000000 {
-		t.Fatal("clip32")
+	// S32 has no clipping: gain must be <= unity (see Convert).
+	Convert(o4, in, 1, 1, alsa.S32LE, unity)
+	if int32(binary.LittleEndian.Uint32(o4)) != 32767<<16 || int32(binary.LittleEndian.Uint32(o4[4:])) != -32768<<16 {
+		t.Fatal("s32 unity extremes")
 	}
 	Convert(o4, in, 1, 1, alsa.S24LE, unity)
 	if int32(binary.LittleEndian.Uint32(o4[8:])) != 1000<<8 || int32(binary.LittleEndian.Uint32(o4[4:])) != -32768<<8 {

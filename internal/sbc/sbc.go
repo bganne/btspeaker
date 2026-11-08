@@ -50,7 +50,8 @@ type dstate struct {
 
 // Decoder holds the synthesis filter state; one per stream, not safe for concurrent use.
 type Decoder struct {
-	st [2]dstate
+	st   [2]dstate
+	last FrameInfo // parameters of the previous frame, to detect changes
 }
 
 func NewDecoder() *Decoder { return &Decoder{} }
@@ -279,6 +280,11 @@ func (d *Decoder) Decode(frame []byte, pcm []int16) (consumed, n int, info Frame
 		// The header parsed and the frame is fully present, so report its length:
 		// the caller can skip it and keep decoding the rest of the packet.
 		return fi.FrameLen, 0, info, ErrCRC
+	}
+	// Stream parameters changed: stale synthesis state would glitch.
+	if cur := (FrameInfo{SampleRate: fi.SampleRate, Channels: fi.Channels, Mode: fi.Mode,
+		Blocks: fi.Blocks, Subbands: fi.Subbands, Loudness: fi.Loudness}); cur != d.last {
+		*d = Decoder{last: cur}
 	}
 	nch, nsb, nblk := fi.Channels, fi.Subbands, fi.Blocks
 	if len(pcm) < nch*nsb*nblk {

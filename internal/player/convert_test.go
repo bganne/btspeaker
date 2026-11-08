@@ -215,3 +215,24 @@ func TestFadeIn(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertS32Extremes(t *testing.T) {
+	in := []int16{-32768, 32767, 0}
+	var rng uint32
+	dst := make([]byte, 24)
+	convert(dst, in, 1, 1, alsa.S32LE, unity, &rng)
+	want := []int32{-32768 << 16, 32767 << 16, 0}
+	for i, w := range want {
+		if g := int32(binary.LittleEndian.Uint32(dst[4*i:])); g != w {
+			t.Errorf("flat[%d]=%d want %d", i, g, w)
+		}
+	}
+	convert(dst, in, 1, 2, alsa.S32LE, unity, &rng)
+	for i, w := range want {
+		for c := 0; c < 2; c++ {
+			if g := int32(binary.LittleEndian.Uint32(dst[8*i+4*c:])); g != w {
+				t.Errorf("dup[%d][%d]=%d want %d", i, c, g, w)
+			}
+		}
+	}
+}

@@ -532,7 +532,8 @@ func configure(fd, rate, channels int, f Format, bufferFrames int) (*PCM, error)
 	}
 	// Boundary: largest multiple of the buffer size that fits in a signed long.
 	boundary := uintptr(buffer)
-	for boundary*2 <= uintptr(1)<<(unsafe.Sizeof(uintptr(0))*8-1)-1 {
+	longMax := uintptr(1)<<(unsafe.Sizeof(uintptr(0))*8-1) - 1
+	for boundary*2 <= longMax-uintptr(buffer) {
 		boundary *= 2
 	}
 	sw.boundary = boundary

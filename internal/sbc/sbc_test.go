@@ -436,3 +436,30 @@ func TestGenDerivedVectors(t *testing.T) {
 		write("snr_"+src+".sbc", frames)
 	}
 }
+
+func TestParamChangeResets(t *testing.T) {
+	frames := loadFrames(t, "joint_44k_chirp.sbc")
+	// Valid mono 16 kHz frame: different parameters from the chirp stream.
+	other := []byte{0x9c, 0x1c, 20, 0}
+	fi, ok := parseHeader(other)
+	if !ok {
+		t.Fatal("bad header")
+	}
+	for len(other) < fi.FrameLen {
+		other = append(other, byte(len(other)*37))
+	}
+	other[3] = crc8(&fi, other)
+
+	a, b := make([]int16, 256), make([]int16, 256)
+	d := NewDecoder()
+	d.Decode(frames[0], a)
+	d.Decode(frames[1], a)
+	if _, _, _, err := d.Decode(other, a); err != nil {
+		t.Fatal(err)
+	}
+	d.Decode(frames[0], a)
+	NewDecoder().Decode(frames[0], b)
+	if *(*[256]int16)(a) != *(*[256]int16)(b) {
+		t.Error("parameter change did not reset state")
+	}
+}

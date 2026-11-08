@@ -129,7 +129,7 @@ func convertFlat(dst []byte, pcm []int16, f alsa.Format, gain int32, rng *uint32
 	default: // S32LE
 		dst = dst[:4*len(pcm)]
 		for i, s := range pcm {
-			v := clip32((int64(s) * int64(gain)) << 1) // s<<16 * gain>>15
+			v := (int32(s) * gain) << 1 // s<<16 * gain>>15
 			binary.LittleEndian.PutUint32(dst[4*i:], uint32(v))
 		}
 	}
@@ -159,21 +159,11 @@ func convertDup(dst []byte, pcm []int16, f alsa.Format, gain int32, rng *uint32)
 	default:
 		dst = dst[:8*len(pcm)]
 		for i, s := range pcm {
-			v := uint32(clip32((int64(s) * int64(gain)) << 1))
+			v := uint32((int32(s) * gain) << 1)
 			binary.LittleEndian.PutUint32(dst[8*i:], v)
 			binary.LittleEndian.PutUint32(dst[8*i+4:], v)
 		}
 	}
-}
-
-func clip32(v int64) int32 {
-	if v > math.MaxInt32 {
-		return math.MaxInt32
-	}
-	if v < math.MinInt32 {
-		return math.MinInt32
-	}
-	return int32(v)
 }
 
 func clip16(v int32) int32 {
