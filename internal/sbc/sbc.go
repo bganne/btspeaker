@@ -38,6 +38,7 @@ var (
 	ErrSync      = errors.New("sbc: bad syncword or header")
 	ErrTruncated = errors.New("sbc: truncated frame")
 	ErrCRC       = errors.New("sbc: CRC mismatch")
+	ErrPCMSize   = errors.New("sbc: pcm buffer too small")
 )
 
 const headerSize = 4
@@ -281,14 +282,14 @@ func (d *Decoder) Decode(frame []byte, pcm []int16) (consumed, n int, info Frame
 		// the caller can skip it and keep decoding the rest of the packet.
 		return fi.FrameLen, 0, info, ErrCRC
 	}
+	nch, nsb, nblk := fi.Channels, fi.Subbands, fi.Blocks
+	if len(pcm) < nch*nsb*nblk {
+		return 0, 0, info, ErrPCMSize // before the reset: keep the synthesis state
+	}
 	// Stream parameters changed: stale synthesis state would glitch.
 	if cur := (FrameInfo{SampleRate: fi.SampleRate, Channels: fi.Channels, Mode: fi.Mode,
 		Blocks: fi.Blocks, Subbands: fi.Subbands, Loudness: fi.Loudness}); cur != d.last {
 		*d = Decoder{last: cur}
-	}
-	nch, nsb, nblk := fi.Channels, fi.Subbands, fi.Blocks
-	if len(pcm) < nch*nsb*nblk {
-		return 0, 0, info, errors.New("sbc: pcm buffer too small")
 	}
 
 	br := bitReader{b: frame[:fi.FrameLen], idx: headerSize}

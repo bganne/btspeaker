@@ -335,7 +335,7 @@ func TestErrors(t *testing.T) {
 	if err != nil || c != len(frames[0]) || info.FrameLen != c {
 		t.Errorf("trailing: c=%d err=%v", c, err)
 	}
-	if _, _, _, err := d.Decode(f, pcm[:10]); err == nil {
+	if _, _, _, err := d.Decode(f, pcm[:10]); !errors.Is(err, ErrPCMSize) {
 		t.Error("short pcm buffer accepted")
 	}
 }
