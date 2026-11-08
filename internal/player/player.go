@@ -243,7 +243,10 @@ func (p *Player) Write(pcm []int16) {
 		return
 	}
 	frames := int64(len(pcm) / s.inCh)
-	limit := int64(maxQueue) * int64(p.rate) / int64(time.Second)
+	// queued includes the chunk being written. Room for that one, one waiting
+	// and this one: a 16 kHz source sends up to 120 ms per packet, and a
+	// 100 ms bound would drop (and refade) the waiting chunk on any jitter.
+	limit := max(int64(maxQueue)*int64(p.rate)/int64(time.Second), 3*frames)
 	for s.queued.Load()+frames > limit { // bound latency: drop the oldest chunks
 		select {
 		case old := <-s.q:

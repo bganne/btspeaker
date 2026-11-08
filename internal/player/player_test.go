@@ -512,6 +512,40 @@ func TestQueueDropCounted(t *testing.T) {
 	}
 }
 
+// Chunks over maxQueue (16 kHz, 15 SBC frames = 120 ms): one being written
+// and one waiting survive the next chunk; only a fourth drops the oldest.
+func TestLargeChunksKeepOneWaiting(t *testing.T) {
+	g := &gatedPCM{gate: make(chan struct{})}
+	caps := stdCaps()
+	caps.Rates = append(caps.Rates, 16000)
+	b := &gatedBackend{fakeBackend: fakeBackend{caps: caps}, pcm: g}
+	p := newTest(&b.fakeBackend, Config{IdleRelease: time.Hour})
+	p.backend = b
+	defer p.Close()
+	defer func() {
+		select {
+		case <-g.gate:
+		default:
+			close(g.gate)
+		}
+	}()
+	p.Start(16000, 2)
+	chunk := make([]int16, 1920*2)
+	for i := range chunk {
+		chunk[i] = 8000
+	}
+	for i := 0; i < 3; i++ {
+		p.Write(chunk)
+	}
+	if d := p.Status().QueueDrop; d != 0 {
+		t.Fatalf("QueueDrop = %d after 3 chunks, want 0", d)
+	}
+	p.Write(chunk)
+	if d := p.Status().QueueDrop; d != 1920 {
+		t.Fatalf("QueueDrop = %d after 4 chunks, want 1920", d)
+	}
+}
+
 func TestFadeTail(t *testing.T) {
 	last := []byte{0xe8, 0x03, 0x18, 0xfc} // L=1000 R=-1000
 	b := fadeTail(last, alsa.S16LE, 2, fadeFrames)
