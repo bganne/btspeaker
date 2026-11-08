@@ -140,10 +140,10 @@ type stream struct {
 	haveSSRC bool
 }
 
-// outCap is the initial st.out capacity in samples (~40 KB): 15 frames plus
-// 100 ms of fill at 48 kHz stereo plus the fade/concealment budget, with
+// outCap is the initial st.out capacity in samples (~48 KB): 15 frames (3840
+// samples) plus a 200 ms concealment burst at 48 kHz stereo (19200), with
 // margin, so the steady state never reallocates.
-const outCap = 20000
+const outCap = 24000
 
 func newStream(s *Server, d *device, c bt.Conn, dec decoder) *stream {
 	return &stream{s: s, d: d, c: c, dec: dec, gen: -1, out: make([]int16, 0, outCap)}
@@ -212,13 +212,6 @@ func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
 	}
 	st.dups = 0
 	cc.seq, cc.haveSeq = seq, true
-	// Valid, non-duplicate packet: only now does it count as liveness, so
-	// junk on the channel can't hold the SEP against stale-stream eviction.
-	s.mu.Lock()
-	if d.st == stStreaming && s.owner == d && d.media == c {
-		d.lastRTP = time.Now()
-	}
-	s.mu.Unlock()
 	hdr := payload[0]
 	frames := int(hdr & 0x0F)
 	frameSamples := cfg.blocks * cfg.subbands
@@ -283,6 +276,7 @@ func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
 	}
 	payload = payload[1:]
 	start := len(out)
+	decoded := false
 	for i := 0; i < frames && len(payload) > 0; i++ {
 		consumed, k, fi, err := dec.Decode(payload, pcm[:])
 		bad := err != nil || consumed <= 0
@@ -316,6 +310,17 @@ func (st *stream) onPacket(seq uint16, ts, cur uint32, payload []byte) {
 		cc.fade(pcm[:k])
 		out = append(out, pcm[:k]...)
 		payload = payload[consumed:]
+		decoded = true
+	}
+	if decoded {
+		// Valid, non-duplicate packet with audio: only now does it count as
+		// liveness, so junk or empty packets can't hold the SEP against
+		// stale-stream eviction.
+		s.mu.Lock()
+		if d.st == stStreaming && s.owner == d && d.media == c {
+			d.lastRTP = time.Now()
+		}
+		s.mu.Unlock()
 	}
 	cc.nextTS = ts + uint32((len(out)-start)/ch)
 	cc.haveTS = true

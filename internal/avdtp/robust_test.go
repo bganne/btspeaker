@@ -568,8 +568,20 @@ func TestJunkAndDuplicatesDontRefreshLastRTP(t *testing.T) {
 	if got := lastRTP(s, [6]byte{}); !got.Equal(old) {
 		t.Fatal("junk or duplicate refreshed lastRTP")
 	}
-	media.in <- rtp(2, 128, 1, 1, 1, 1)
+	media.in <- rtp(2, 128) // valid header, no frames
+	media.in <- rtp(2, 128) // duplicate: a sync point for the empty one
+	waitFor(t, func() bool { return s.Stats().DroppedDup == 2 })
+	if got := lastRTP(s, [6]byte{}); !got.Equal(old) {
+		t.Fatal("empty packet refreshed lastRTP")
+	}
+	if st := s.Streams(); len(st) != 1 || st[0].State != "paused" {
+		t.Fatalf("no audio for an hour: streams %+v, want paused", st)
+	}
+	media.in <- rtp(3, 128, 1, 1, 1, 1)
 	waitFor(t, func() bool { return !lastRTP(s, [6]byte{}).Equal(old) })
+	if st := s.Streams(); len(st) != 1 || st[0].State != "streaming" {
+		t.Fatalf("audio again: streams %+v, want streaming", st)
+	}
 }
 
 func TestBadFrameSilenceIsBudgeted(t *testing.T) {

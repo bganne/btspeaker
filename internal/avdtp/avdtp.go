@@ -29,7 +29,7 @@ type Config struct {
 // StreamInfo is the current stream for status display.
 type StreamInfo struct {
 	Device     bt.Addr
-	State      string // "idle","configured","open","streaming"
+	State      string // "idle","configured","open","streaming","paused"
 	SampleRate int
 	Channels   int
 	Mode       string // "joint stereo", ...
@@ -198,14 +198,24 @@ func (s *Server) MayControlVolume(a bt.Addr) bool {
 }
 
 // Streams returns current streams (normally 0 or 1).
+// pausedAfter is how long a streaming SEP may go without audio before
+// Streams reports it as paused.
+const pausedAfter = time.Second
+
 func (s *Server) Streams() []StreamInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []StreamInfo
 	if d := s.owner; d != nil {
+		st := d.st.String()
+		if d.st == stStreaming && time.Since(d.lastRTP) > pausedAfter {
+			// Many sources pause without SUSPEND: the AVDTP state stays
+			// streaming while no audio arrives.
+			st = "paused"
+		}
 		out = append(out, StreamInfo{
 			Device:     d.addr,
-			State:      d.st.String(),
+			State:      st,
 			SampleRate: d.cfg.rate,
 			Channels:   d.cfg.channels(),
 			Mode:       d.cfg.modeName(),
