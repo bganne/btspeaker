@@ -88,6 +88,32 @@ func TestIdleConfiguredTimesOut(t *testing.T) {
 	waitFor(t, func() bool { return !s.HasSession(dc.addr) })
 }
 
+func TestJunkDoesNotExtendIdleTimeout(t *testing.T) {
+	s := newTestServer(&fakeSink{})
+	dc := newDeadlineConn(1)
+	go s.HandleConn(dc)
+	expect(t, dc.fakeConn, "setconf", append([]byte{0x30, 0x03}, setConf...), []byte{0x32, 0x03})
+	armedBy := time.Now().Add(idleTimeout) // the setconf accept armed the deadline before this
+	time.Sleep(50 * time.Millisecond)
+	dc.in <- []byte{0x52, 0x01} // stray accept: ignored
+	dc.in <- []byte{0x40, 0x02} // GET_CAPABILITIES without SEID: rejected
+	select {
+	case b := <-dc.out:
+		if b[0]&3 != msgReject {
+			t.Fatalf("got %x, want a reject", b)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no reply")
+	}
+	dc.mu.Lock()
+	dl := dc.dl
+	dc.mu.Unlock()
+	if dl.After(armedBy) {
+		t.Fatalf("deadline extended by %v by a stray/rejected packet", dl.Sub(armedBy))
+	}
+	dc.Close()
+}
+
 func TestTimestampJitterNotLoss(t *testing.T) {
 	sink := &fakeSink{}
 	s := newTestServer(sink)

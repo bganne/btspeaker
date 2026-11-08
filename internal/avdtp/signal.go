@@ -281,12 +281,20 @@ func (s *Server) signalling(d *device, c bt.Conn, first []byte) {
 	}
 	buf := make([]byte, n)
 	dl, _ := c.(interface{ SetDeadline(time.Time) error })
+	// idleEnd moves only on accepted commands (or when media goes away), so
+	// junk or stray packets cannot keep an idle channel open forever.
+	var idleEnd time.Time
 	for {
 		if dl != nil {
 			var t time.Time // none once a media channel exists (streaming or suspended)
 			s.mu.Lock()
 			if d.st < stOpen || d.media == nil {
-				t = time.Now().Add(idleTimeout)
+				if idleEnd.IsZero() {
+					idleEnd = time.Now().Add(idleTimeout)
+				}
+				t = idleEnd
+			} else {
+				idleEnd = time.Time{} // re-armed in full once media is gone
 			}
 			dl.SetDeadline(t) // under mu: must not overwrite a concurrent re-arm
 			s.mu.Unlock()
@@ -324,6 +332,9 @@ func (s *Server) signalling(d *device, c bt.Conn, first []byte) {
 		if rsp == nil {
 			continue
 		}
+		if rsp[0]&3 == msgAccept {
+			idleEnd = time.Now().Add(idleTimeout)
+		}
 		// Bounded write: a peer that never reads its replies must not block this
 		// goroutine for good (the read deadline is cleared while media is live).
 		if wd, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
@@ -350,7 +361,7 @@ func (s *Server) reassemble(d *device, p []byte) (label, sig byte, params []byte
 		return label, p[1] & 0x3F, p[2:], msg, true
 	case pktStart:
 		d.reasm = nil
-		if len(p) < 3 || p[1] < 2 {
+		if len(p) < 3 || p[1] < 2 || len(p)-3 > maxReassembled {
 			return
 		}
 		d.reasm = &reassembly{label: label, msg: msg, nPkts: int(p[1]), got: 1, signal: p[2] & 0x3F, data: append([]byte(nil), p[3:]...)}
