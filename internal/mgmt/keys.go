@@ -9,6 +9,11 @@ import (
 // maxLinkKeyType is the highest key type the kernel accepts in Load Link Keys.
 const maxLinkKeyType = 8
 
+// debugLinkKeyType is a debug combination key: derived from the public SSP
+// debug key pair, so anyone can compute it. The kernel silently skips it on
+// load (debug_keys=0), so it must never count as loaded or be stored.
+const debugLinkKeyType = 3
+
 // storedKeys returns the valid stored link keys, as sent to Load Link Keys.
 func (c *Controller) storedKeys() []Key {
 	var keys []Key
@@ -25,7 +30,7 @@ func (c *Controller) storedKeys() []Key {
 			c.log.Warn("skipping bad stored key", "addr", d.Addr)
 			continue
 		}
-		if d.LinkKey.Type > maxLinkKeyType {
+		if d.LinkKey.Type > maxLinkKeyType || d.LinkKey.Type == debugLinkKeyType {
 			c.log.Warn("skipping stored key with invalid type", "addr", d.Addr, "type", d.LinkKey.Type)
 			continue
 		}

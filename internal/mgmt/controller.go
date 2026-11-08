@@ -74,19 +74,23 @@ type Controller struct {
 	winMu  sync.Mutex
 	closed bool // set by Shutdown under winMu: OpenPairing must not reopen the window
 
-	mu       sync.Mutex
-	cl       *Client
-	index    uint16
-	present  bool
-	info     Info
-	conns    map[bt.Addr]bool
-	names    map[bt.Addr]string // names learnt from connections
-	pending  map[bt.Addr]string // names of known devices seen at ACL connect, not yet authenticated
-	deadline time.Time
-	timer    *time.Timer
-	lastErr  string
-	refused  map[bt.Addr]bool // strangers already warned about (bounded)
-	refusedT time.Time        // last time the full refused set was cleared
+	mu      sync.Mutex
+	cl      *Client
+	index   uint16
+	present bool
+	// initialising is set while initAdapter runs: the adapter is picked but
+	// not configured yet. Status reports it absent and the public actions fail
+	// fast with ErrNoAdapter instead of waiting on winMu.
+	initialising bool
+	info         Info
+	conns        map[bt.Addr]bool
+	names        map[bt.Addr]string // names learnt from connections
+	pending      map[bt.Addr]string // names of known devices seen at ACL connect, not yet authenticated
+	deadline     time.Time
+	timer        *time.Timer
+	lastErr      string
+	refused      map[bt.Addr]bool // strangers already warned about (bounded)
+	refusedT     time.Time        // last time the full refused set was cleared
 	// loaded holds the devices whose key the kernel actually has: loaded at
 	// init or stored from New Link Key. A stored device missing from it (bad
 	// key, failed Load Link Keys) is treated as a stranger by Admit.
@@ -264,7 +268,7 @@ func (c *Controller) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := Status{
-		Present:        c.present,
+		Present:        c.present && !c.initialising,
 		Addr:           c.info.Addr,
 		Name:           c.info.Name,
 		Powered:        c.info.Current&SettingPowered != 0,
@@ -288,9 +292,9 @@ func (c *Controller) Status() Status {
 // cmd sends a command to the managed adapter.
 func (c *Controller) cmd(op uint16, params []byte) ([]byte, error) {
 	c.mu.Lock()
-	cl, idx, present := c.cl, c.index, c.present
+	cl, idx, ready := c.cl, c.index, c.present && !c.initialising
 	c.mu.Unlock()
-	if !present {
+	if !ready {
 		return nil, ErrNoAdapter
 	}
 	return cl.Do(idx, op, params)
@@ -317,6 +321,9 @@ func (c *Controller) OpenPairing(d time.Duration) error {
 	}
 	if secs > maxDiscoverableSecs {
 		secs = maxDiscoverableSecs
+	}
+	if c.isInitialising() {
+		return ErrNoAdapter
 	}
 	c.winMu.Lock()
 	defer c.winMu.Unlock()
@@ -359,6 +366,9 @@ func (c *Controller) closeIfDeadline(dl time.Time) {
 
 // ClosePairing closes the window and makes the adapter non-discoverable.
 func (c *Controller) ClosePairing() error {
+	if c.isInitialising() {
+		return ErrNoAdapter
+	}
 	c.winMu.Lock()
 	defer c.winMu.Unlock()
 	return c.closePairingLocked()
@@ -454,7 +464,11 @@ func (c *Controller) Disconnect(addr bt.Addr) error {
 // Forget unpairs addr (disconnecting it) and drops the stored key.
 func (c *Controller) Forget(addr bt.Addr) error {
 	// Serialised with initAdapter: a re-init between the unpair and the store
-	// removal would reload the key and re-admit the device.
+	// removal would reload the key and re-admit the device. During init it
+	// fails fast rather than block on winMu.
+	if c.isInitialising() {
+		return ErrNoAdapter
+	}
 	c.winMu.Lock()
 	defer c.winMu.Unlock()
 	c.mu.Lock()
@@ -563,6 +577,12 @@ func (c *Controller) isPresent() bool {
 	return c.present
 }
 
+func (c *Controller) isInitialising() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.initialising
+}
+
 // initBackoff is the delay before retrying after fails consecutive failed
 // inits: 5, 10, 20, 40 s, then 60 s. Each retry power-cycles the dongle.
 func initBackoff(fails int) time.Duration {
@@ -659,8 +679,20 @@ func (c *Controller) pick(cl *Client) (uint16, Info, error) {
 func (c *Controller) initAdapter() error {
 	// Held throughout so a concurrent OpenPairing cannot be overwritten by the
 	// bondable/discoverable-off steps (OpenPairing waits, or fails: not present).
+	// The public actions see initialising and fail fast instead of waiting
+	// (up to ~17 commands with a 5 s timeout each on hung firmware).
+	// Internal cmd() callers hold winMu or run on the event goroutine (as
+	// init does), so none is refused by it.
 	c.winMu.Lock()
 	defer c.winMu.Unlock()
+	c.mu.Lock()
+	c.initialising = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.initialising = false
+		c.mu.Unlock()
+	}()
 	cl := c.client()
 	idx, info, err := c.pick(cl)
 	if err != nil {
@@ -991,6 +1023,12 @@ func (c *Controller) onNewLinkKey(p []byte) {
 	}
 	if err != nil {
 		c.log.Warn("bad new link key", "err", err)
+		return
+	}
+	if n.Key.Type == debugLinkKeyType {
+		// Publicly computable: never trust or store it.
+		c.log.Warn("pairing refused: debug link key", "addr", n.Key.Addr.String())
+		c.revokeKey(n.Key.Addr)
 		return
 	}
 	// The kernel auto-accepts Just Works pairing without a User Confirm Request,

@@ -509,6 +509,46 @@ func TestAdmit(t *testing.T) {
 	}
 }
 
+func TestDebugKeyRefusedInWindow(t *testing.T) {
+	peer := bt.Addr{0xB0, 5}
+	fake, c, st := startFake(t, false)
+	if err := c.OpenPairing(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	ev := newLinkKeyEvent(peer, true)
+	ev[8] = debugLinkKeyType
+	fake.event(EvNewLinkKey, 0, ev)
+	waitFor(t, "unpair", func() bool { return fake.count(OpUnpairDevice) == 1 })
+	if st.Has(peer) || c.isLoaded(peer) {
+		t.Fatal("debug link key stored or trusted")
+	}
+}
+
+func TestActionsFailFastDuringInit(t *testing.T) {
+	_, c, _ := startFake(t, false)
+	c.mu.Lock()
+	c.initialising = true
+	c.mu.Unlock()
+	c.winMu.Lock() // as initAdapter does: the actions must not wait on it
+	defer c.winMu.Unlock()
+	if c.Status().Present {
+		t.Error("Status: present while initialising")
+	}
+	for name, err := range map[string]error{
+		"open":   c.OpenPairing(time.Second),
+		"close":  c.ClosePairing(),
+		"forget": c.Forget(bt.Addr{1}),
+		"name":   c.SetName("x"),
+	} {
+		if !errors.Is(err, ErrNoAdapter) {
+			t.Errorf("%s: err = %v, want ErrNoAdapter", name, err)
+		}
+	}
+	c.mu.Lock()
+	c.initialising = false
+	c.mu.Unlock()
+}
+
 func TestBondableFollowsWindow(t *testing.T) {
 	fake, c, _ := startFake(t, false)
 	if p := fake.lastParams(OpSetBondable); !bytes.Equal(p, []byte{0}) {
@@ -746,12 +786,16 @@ func TestInitSkipsInvalidKeyType(t *testing.T) {
 }
 
 func TestUnloadedKnownDeviceNotAdmitted(t *testing.T) {
-	bad, failed := bt.Addr{0xA0, 2}, bt.Addr{0xA0, 3}
+	bad, debug, failed := bt.Addr{0xA0, 2}, bt.Addr{0xA0, 4}, bt.Addr{0xA0, 3}
 	dir := t.TempDir()
-	seedKey(t, dir, bad, 9) // invalid type: skipped at init
+	seedKey(t, dir, bad, 9)   // invalid type: skipped at init
+	seedKey(t, dir, debug, 3) // debug combination: skipped at init
 	_, c, st := startFakeDir(t, false, dir)
 	if !st.Has(bad) || c.Admit(bad) {
 		t.Fatal("stored device with an unloaded key admitted with the window closed")
+	}
+	if !st.Has(debug) || c.Admit(debug) {
+		t.Fatal("stored device with a debug key admitted with the window closed")
 	}
 
 	// Load Link Keys fails (batch, then the single key): none loads, so no stored device is admitted.
