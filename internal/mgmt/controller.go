@@ -48,6 +48,11 @@ type Config struct {
 	Store           *store.Store
 	Log             *slog.Logger
 	Open            func() (io.ReadWriteCloser, error) // default: hci.OpenMgmt
+	// OnSocketLost, if set, is called once when the mgmt socket fails; the
+	// controller then stops instead of reopening it. Needed once the process
+	// has dropped CAP_NET_ADMIN: a reopened socket would be untrusted and
+	// refuse every command but reads.
+	OnSocketLost func()
 }
 
 // Status is a snapshot of the adapter state.
@@ -531,7 +536,6 @@ func (c *Controller) run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		c.log.Error("mgmt socket closed, reopening")
 		c.setErr("mgmt socket closed")
 		c.mu.Lock()
 		c.present = false
@@ -541,6 +545,12 @@ func (c *Controller) run(ctx context.Context) {
 			c.timer.Stop()
 		}
 		c.mu.Unlock()
+		if c.cfg.OnSocketLost != nil {
+			c.log.Error("mgmt socket closed")
+			c.cfg.OnSocketLost()
+			return
+		}
+		c.log.Error("mgmt socket closed, reopening")
 		for {
 			select {
 			case <-ctx.Done():

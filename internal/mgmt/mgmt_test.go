@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1314,5 +1315,39 @@ func TestNoBondingSessionRekeyKeepsConnection(t *testing.T) {
 	}
 	if st.Has(addr) {
 		t.Fatal("session key stored")
+	}
+}
+
+func TestControllerOnSocketLost(t *testing.T) {
+	fake, conn := newFake(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost := make(chan struct{}, 2)
+	var opens atomic.Int32
+	c := New(Config{Name: "Test", Store: st, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Open:         func() (io.ReadWriteCloser, error) { opens.Add(1); return conn, nil },
+		OnSocketLost: func() { lost <- struct{}{} }})
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Shutdown()
+	waitFor(t, "ready", func() bool { return c.Status().Present && fake.count(OpGetConnections) == 1 })
+	fake.conn.Close()
+	select {
+	case <-lost:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnSocketLost not called")
+	}
+	if c.Status().Present {
+		t.Error("adapter still present after socket loss")
+	}
+	time.Sleep(2500 * time.Millisecond) // past the reopen delay
+	if n := opens.Load(); n != 1 {
+		t.Errorf("socket opened %d times, want 1 (no reopen)", n)
+	}
+	if len(lost) != 0 {
+		t.Error("OnSocketLost called twice")
 	}
 }
