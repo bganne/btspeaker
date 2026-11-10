@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
@@ -47,6 +48,7 @@ type options struct {
 	httpUser       string
 	httpPassword   string
 	httpHosts      string
+	httpAllow      []netip.Prefix // nil: any peer
 	listDevices    bool
 	testTone       bool
 }
@@ -102,6 +104,7 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 	fs.StringVar(&o.httpUser, "http-user", "admin", "HTTP basic auth user")
 	fs.StringVar(&o.httpPassword, "http-password", "", "HTTP basic auth password (empty = no auth); visible in ps, prefer BTSPEAKER_HTTP_PASSWORD")
 	fs.StringVar(&o.httpHosts, "http-hosts", "", "comma-separated hostnames accepted in the HTTP Host header (default: hostname, FQDN, hostname.local, localhost; IP literals always accepted)")
+	httpAllow := fs.String("http-allow", "private", "comma-separated peers allowed to connect to the web UI: CIDRs or IPs, \"private\" (loopback, RFC 1918, 100.64/10, link-local, IPv6 ULA) or \"any\"")
 	fs.BoolVar(&o.listDevices, "list-devices", false, "print ALSA playback devices and exit")
 	fs.BoolVar(&o.testTone, "test-tone", false, "play a 2 s test tone on -alsa-device and exit")
 	fs.SetOutput(io.Discard) // main prints a parse error once; usage only for -h
@@ -145,6 +148,9 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 		}
 	} else if o.name, err = mgmt.ValidName(o.name); err != nil {
 		return nil, fmt.Errorf("-name: %w", err)
+	}
+	if o.httpAllow, err = parseAllow(*httpAllow); err != nil {
+		return nil, fmt.Errorf("-http-allow: %w", err)
 	}
 	if o.maxBitpool < 2 || o.maxBitpool > 250 {
 		return nil, fmt.Errorf("-sbc-max-bitpool must be 2..250, got %d", o.maxBitpool)
@@ -240,6 +246,8 @@ func run(o *options) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	ctx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
 	if !probed {
 		go reprobeRates(ctx, o.alsaDevice, probeRetry, alsa.Probe, avdtpSrv.SetSampleRates)
 	}
@@ -258,9 +266,12 @@ func run(o *options) error {
 	}()
 
 	ctrl := mgmt.New(mgmt.Config{Adapter: o.adapter, Name: o.name, AlwaysPairable: o.alwaysPairable,
-		PairingTimeout: o.pairingTimeout, RefuseLegacyPIN: o.noLegacyPIN, Store: st, Log: slog.Default()})
+		PairingTimeout: o.pairingTimeout, RefuseLegacyPIN: o.noLegacyPIN, Store: st, Log: slog.Default(),
+		// Capabilities are dropped below, so a reopened socket would be useless:
+		// exit and let systemd restart us.
+		OnSocketLost: func() { fail(errMgmtLost) }})
 	if err := ctrl.Start(ctx); err != nil {
-		return fmt.Errorf("mgmt: %w (needs root or CAP_NET_ADMIN/CAP_NET_RAW)", err)
+		return fmt.Errorf("mgmt: %w (needs root or CAP_NET_ADMIN)", err)
 	}
 
 	var wg sync.WaitGroup
@@ -301,7 +312,7 @@ func run(o *options) error {
 	httpSrv := &http.Server{Addr: o.listen, Handler: web.Handler(be, web.Config{User: o.httpUser, Password: o.httpPassword, Hosts: allowedHosts(o.httpHosts)}),
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second,
 		IdleTimeout: web.IdleTimeout, MaxHeaderBytes: 16 << 10}
-	ln = newConnLimitListener(ln, maxHTTPConns, maxHTTPConnsPerIP)
+	ln = newConnLimitListener(ln, maxHTTPConns, maxHTTPConnsPerIP, o.httpAllow)
 	served = true
 	slog.Info("web UI listening", "addr", ln.Addr().String(), "auth", o.httpPassword != "")
 	go func() {
@@ -309,6 +320,18 @@ func run(o *options) error {
 			slog.Error("http", "err", err)
 		}
 	}()
+
+	// Every socket needing a capability is bound.
+	if err := dropCaps(); errors.Is(err, errCgoBuild) {
+		slog.Warn("capabilities not dropped", "err", err)
+	} else if err != nil {
+		ctrl.Shutdown()
+		httpSrv.Close()
+		closeAll()
+		return fmt.Errorf("dropping capabilities: %w", err)
+	} else {
+		slog.Info("capabilities dropped")
+	}
 
 	<-ctx.Done()
 	stop() // restore default signal handling: a second Ctrl-C kills a hung shutdown
@@ -329,7 +352,76 @@ func run(o *options) error {
 	case <-time.After(shutdownWait):
 		slog.Error("shutdown: accept loops still running, exiting anyway", "after", shutdownWait)
 	}
+	if err := context.Cause(ctx); errors.Is(err, errMgmtLost) {
+		return err // exit 1: systemd restarts us with fresh capabilities
+	}
 	return nil
+}
+
+var errMgmtLost = errors.New("mgmt socket lost")
+
+// privateNets are the peers -http-allow=private admits.
+var privateNets = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"), // CGNAT, also Tailscale
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+}
+
+// parseAllow parses -http-allow; nil means any peer.
+func parseAllow(list string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(list, ",") {
+		switch f = strings.TrimSpace(f); {
+		case f == "":
+		case f == "any":
+			return nil, nil
+		case f == "private":
+			out = append(out, privateNets...)
+		case strings.Contains(f, "/"):
+			p, err := netip.ParsePrefix(f)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, p.Masked())
+		default:
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, err
+			}
+			if a.Zone() != "" {
+				return nil, fmt.Errorf("%q: zones not supported", f)
+			}
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New(`empty (use "any" to allow every peer)`)
+	}
+	return out, nil
+}
+
+// peerAllowed reports whether the peer of remote ("ip:port") is in allow (nil: any).
+func peerAllowed(allow []netip.Prefix, remote string) bool {
+	if allow == nil {
+		return true
+	}
+	ap, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return false
+	}
+	a := ap.Addr().Unmap().WithZone("") // Prefix.Contains is false for zoned addresses
+	for _, p := range allow {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 const shutdownWait = 5 * time.Second
@@ -475,16 +567,19 @@ func reprobeRates(ctx context.Context, dev string, interval time.Duration, probe
 type connLimitListener struct {
 	net.Listener
 	sem   chan struct{}
-	perIP int // max concurrent connections per remote IP
+	perIP int            // max concurrent connections per remote IP
+	allow []netip.Prefix // peers allowed to connect; nil: any
 	done  chan struct{}
 	once  sync.Once
+
+	deniedLog time.Time // last refused-peer warning; only touched by Accept (one caller: http.Server.Serve)
 
 	mu   sync.Mutex
 	byIP map[string]int
 }
 
-func newConnLimitListener(l net.Listener, max, perIP int) *connLimitListener {
-	return &connLimitListener{Listener: l, sem: make(chan struct{}, max), perIP: perIP,
+func newConnLimitListener(l net.Listener, max, perIP int, allow []netip.Prefix) *connLimitListener {
+	return &connLimitListener{Listener: l, sem: make(chan struct{}, max), perIP: perIP, allow: allow,
 		done: make(chan struct{}), byIP: map[string]int{}}
 }
 
@@ -499,6 +594,15 @@ func (l *connLimitListener) Accept() (net.Conn, error) {
 		if err != nil {
 			<-l.sem
 			return nil, err
+		}
+		if !peerAllowed(l.allow, c.RemoteAddr().String()) {
+			if now := time.Now(); now.Sub(l.deniedLog) >= time.Minute { // a scan must not flood the log
+				l.deniedLog = now
+				slog.Warn("http connection refused: peer not in -http-allow", "peer", c.RemoteAddr().String())
+			}
+			c.Close()
+			<-l.sem
+			continue
 		}
 		ip := web.ClientKey(c.RemoteAddr().String())
 		l.mu.Lock()

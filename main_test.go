@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -112,7 +114,7 @@ func TestConnLimitListener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := newConnLimitListener(inner, 2, 2)
+	l := newConnLimitListener(inner, 2, 2, nil)
 	defer l.Close()
 	var cs []net.Conn
 	for range 3 {
@@ -193,7 +195,7 @@ func TestConnLimitListenerPerIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := newConnLimitListener(inner, 10, 2)
+	l := newConnLimitListener(inner, 10, 2, nil)
 	defer l.Close()
 	var cs []net.Conn
 	for range 3 {
@@ -303,5 +305,79 @@ func TestDefaultNameUsedWhenUnset(t *testing.T) {
 	o, err := parseOptions(nil, func(string) (string, bool) { return "", false })
 	if err != nil || o.name != "htpc.benou.fr" {
 		t.Fatalf("name %q, err %v", o.name, err)
+	}
+}
+
+func TestParseAllow(t *testing.T) {
+	for _, bad := range []string{"", " , ", "10.0.0.0/33", "nope", "fe80::1%eth0"} {
+		if _, err := parseAllow(bad); err == nil {
+			t.Errorf("parseAllow(%q) accepted", bad)
+		}
+	}
+	if p, err := parseAllow("private,any"); err != nil || p != nil {
+		t.Errorf("any: %v %v", p, err)
+	}
+	priv, err := parseAllow("private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom, err := parseAllow("203.0.113.7, 2001:db8::/32,10.1.2.3/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		allow  []netip.Prefix
+		remote string
+		want   bool
+	}{
+		{nil, "8.8.8.8:1", true},
+		{priv, "127.0.0.1:1", true},
+		{priv, "192.168.1.5:1", true},
+		{priv, "172.31.0.1:1", true},
+		{priv, "172.32.0.1:1", false},
+		{priv, "100.100.1.1:1", true},
+		{priv, "[::ffff:10.0.0.1]:1", true},
+		{priv, "[::1]:1", true},
+		{priv, "[fd12::1]:1", true},
+		{priv, "[fe80::1%eth0]:1", true},
+		{priv, "8.8.8.8:1", false},
+		{priv, "[2001:db8::1]:1", false},
+		{priv, "garbage", false},
+		{custom, "203.0.113.7:1", true},
+		{custom, "203.0.113.8:1", false},
+		{custom, "[2001:db8:1::1]:1", true},
+		{custom, "10.200.0.1:1", true},
+	} {
+		if got := peerAllowed(c.allow, c.remote); got != c.want {
+			t.Errorf("peerAllowed(%v, %s) = %v", c.allow, c.remote, got)
+		}
+	}
+}
+
+func TestConnLimitListenerAllow(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := newConnLimitListener(inner, 2, 2, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")})
+	defer l.Close()
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	got := make(chan net.Conn, 1)
+	go func() { a, _ := l.Accept(); got <- a }()
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("refused peer: read err %v, want EOF", err)
+	}
+	select {
+	case a := <-got:
+		t.Fatalf("refused peer accepted: %v", a)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if len(l.sem) != 1 { // only the pending Accept's reservation
+		t.Errorf("slots in use %d, want 1", len(l.sem))
 	}
 }

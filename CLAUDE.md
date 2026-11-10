@@ -30,8 +30,8 @@ also running mpd).
   mention reviews (no "review fixes", no review ids); review reports/decisions (`docs/history/`, `docs/review-decisions.md`) stay uncommitted.
 
 ## Commands
-- Test: `go vet ./... && go test ./...`
-- Build host: `go build .` · cubox: `make arm` (CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7)
+- Test: `make test` (CGO_ENABLED=0: the cap-drop test skips in a cgo build)
+- Build host: `make build` (CGO_ENABLED=0, else capabilities are not dropped) · cubox: `make arm` (CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7)
 - `make bench-arm`: armv7 test binaries in `bench-arm/` (sbc.test, player.test); run on cubox with `-test.bench=.`
 - Vet for arm too: `GOARCH=arm go vet ./...`
 - Fuzz: `go test -run=^$ -fuzz=FuzzDecode -fuzztime=60s ./internal/sbc` (also `FuzzSignal`, `FuzzRTP`, `FuzzStream` in `./internal/avdtp`; `FuzzSDP` in `./internal/sdp`; `FuzzAVRCP` in `./internal/avrcp`)
