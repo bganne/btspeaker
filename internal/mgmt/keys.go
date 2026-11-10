@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"errors"
 	"log/slog"
 
 	"btspeaker/internal/bt"
@@ -43,7 +44,9 @@ func (c *Controller) storedKeys() []Key {
 // a load of the accepted ones; the rejected keys are logged. It returns the
 // loaded keys, or an error if even that final load fails. do sends one Load
 // Link Keys command. The batch is tried first unless the caller already
-// did (batchFailed).
+// did (batchFailed). Only a per-key status error (a rejection) skips the key;
+// any other error (timeout, closed socket) is returned, so a hung controller
+// fails init instead of loading zero keys after it recovers.
 func loadKeysTolerant(do func(params []byte) error, keys []Key, batchFailed bool, log *slog.Logger) ([]Key, error) {
 	if !batchFailed && do(EncodeLoadLinkKeys(keys)) == nil {
 		return keys, nil
@@ -51,6 +54,10 @@ func loadKeysTolerant(do func(params []byte) error, keys []Key, batchFailed bool
 	var good []Key
 	for _, k := range keys {
 		if err := do(EncodeLoadLinkKeys([]Key{k})); err != nil {
+			var se *StatusError
+			if !errors.As(err, &se) {
+				return nil, err
+			}
 			log.Warn("kernel rejected stored link key", "addr", k.Addr.String(), "err", err)
 			continue
 		}

@@ -83,6 +83,11 @@ type Controller struct {
 	cl      *Client
 	index   uint16
 	present bool
+	// poweredOn is set once an init powered the adapter on, even if a later
+	// step failed (present then goes false): Shutdown must still undo an
+	// AlwaysPairable init's discoverable/bondable. Cleared when the adapter or
+	// the socket goes away.
+	poweredOn bool
 	// initialising is set while initAdapter runs: the adapter is picked but
 	// not configured yet. Status reports it absent and the public actions fail
 	// fast with ErrNoAdapter instead of waiting on winMu.
@@ -164,7 +169,7 @@ func (c *Controller) Shutdown() {
 		c.timer.Stop()
 	}
 	c.deadline = time.Time{}
-	present := c.present
+	present, poweredOn, idx, cl := c.present, c.poweredOn, c.index, c.cl
 	c.mu.Unlock()
 	// initAdapter holds winMu across many commands; if it does not release it
 	// soon, abort it by closing the socket and skip the close-pairing commands
@@ -186,6 +191,14 @@ func (c *Controller) Shutdown() {
 			}
 			if err != nil {
 				c.log.Warn("shutdown: closing pairing window failed", "err", err)
+			}
+		} else if poweredOn && c.cfg.AlwaysPairable && cl != nil {
+			// An init failed after power on (e.g. at the discoverable step):
+			// cmd refuses while not present, so talk to the index directly.
+			_, err1 := cl.Do(idx, OpSetDiscoverable, EncodeSetDiscoverable(0, 0))
+			_, err2 := cl.Do(idx, OpSetBondable, u8(false))
+			if err := errors.Join(err1, err2); err != nil {
+				c.log.Warn("shutdown: closing pairing after failed init", "err", err)
 			}
 		}
 		c.winMu.Unlock()
@@ -369,6 +382,20 @@ func (c *Controller) closeIfDeadline(dl time.Time) {
 	}
 }
 
+// closeUnlessReopened closes the window after the first pairing (which
+// zeroed the deadline), unless OpenPairing opened a new one since.
+func (c *Controller) closeUnlessReopened() error {
+	c.winMu.Lock()
+	defer c.winMu.Unlock()
+	c.mu.Lock()
+	reopened := !c.deadline.IsZero()
+	c.mu.Unlock()
+	if reopened {
+		return nil
+	}
+	return c.closePairingLocked()
+}
+
 // ClosePairing closes the window and makes the adapter non-discoverable.
 func (c *Controller) ClosePairing() error {
 	if c.isInitialising() {
@@ -538,7 +565,7 @@ func (c *Controller) run(ctx context.Context) {
 		}
 		c.setErr("mgmt socket closed")
 		c.mu.Lock()
-		c.present = false
+		c.present, c.poweredOn = false, false
 		c.conns = map[bt.Addr]bool{}
 		c.deadline = time.Time{}
 		if c.timer != nil {
@@ -717,7 +744,7 @@ func (c *Controller) initAdapter() error {
 		return err
 	}
 	c.mu.Lock()
-	c.index, c.info, c.present = idx, info, true
+	c.index, c.info, c.present, c.poweredOn = idx, info, true, false
 	c.deadline = time.Time{}
 	c.conns = map[bt.Addr]bool{}
 	c.loaded = map[bt.Addr]bool{}
@@ -824,6 +851,11 @@ func (c *Controller) initAdapter() error {
 		if s.op == OpLoadLinkKeys {
 			fillLoaded()
 		}
+		if s.op == OpSetPowered && s.params[0] == 1 {
+			c.mu.Lock()
+			c.poweredOn = true
+			c.mu.Unlock()
+		}
 	}
 	if d, err := cl.Do(idx, OpReadInfo, nil); err == nil {
 		if ni, err := DecodeInfo(d); err == nil {
@@ -860,6 +892,9 @@ func (c *Controller) handle(ev Event) {
 	case EvIndexRemoved:
 		c.mu.Lock()
 		hit := c.present && c.index == ev.Index
+		if c.index == ev.Index {
+			c.poweredOn = false
+		}
 		if hit {
 			c.present = false
 			c.conns = map[bt.Addr]bool{}
@@ -1144,7 +1179,7 @@ func (c *Controller) acceptKey(n NewLinkKey, isNew bool) {
 	if closeWin {
 		// The window timer no longer matches the deadline, so close the
 		// window on every return path, including a failed key save.
-		defer func() { go func() { c.logErr("close pairing window", c.ClosePairing()) }() }()
+		defer func() { go func() { c.logErr("close pairing window", c.closeUnlessReopened()) }() }()
 	}
 	if !n.StoreHint {
 		c.log.Info("link key not to be stored", "addr", n.Key.Addr.String())

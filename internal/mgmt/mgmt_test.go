@@ -1351,3 +1351,99 @@ func TestControllerOnSocketLost(t *testing.T) {
 		t.Error("OnSocketLost called twice")
 	}
 }
+
+func TestLoadKeysTolerantStopsOnTransportError(t *testing.T) {
+	keys := []Key{{Addr: bt.Addr{1}}, {Addr: bt.Addr{2}}, {Addr: bt.Addr{3}}}
+	calls := 0
+	do := func([]byte) error {
+		calls++
+		return errors.New("mgmt: command timeout")
+	}
+	good, err := loadKeysTolerant(do, keys, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || good != nil || calls != 1 {
+		t.Fatalf("good %v err %v after %d calls; want the timeout after 1 call", good, err, calls)
+	}
+}
+
+func TestCloseUnlessReopened(t *testing.T) {
+	fake, c, _ := startFake(t, false)
+	if err := c.OpenPairing(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	n := fake.count(OpSetDiscoverable)
+	// The first pairing's goroutine runs after the user reopened the window.
+	if err := c.closeUnlessReopened(); err != nil || !pairingOpen(c) || fake.count(OpSetDiscoverable) != n {
+		t.Fatalf("reopened window closed: err %v open %v", err, pairingOpen(c))
+	}
+	c.mu.Lock()
+	c.deadline = time.Time{} // as acceptKey does
+	c.mu.Unlock()
+	if err := c.closeUnlessReopened(); err != nil || fake.count(OpSetDiscoverable) != n+1 {
+		t.Fatalf("window not closed: err %v", err)
+	}
+}
+
+// replyThenClose answers the first command and ends the connection, and
+// returns from Write only once the client has seen the end: Do then finds
+// both the reply and done ready.
+type replyThenClose struct {
+	net.Conn
+	peer net.Conn
+	cl   chan *Client
+}
+
+func (r *replyThenClose) Write(p []byte) (int, error) {
+	h, _, err := DecodePacket(p)
+	if err != nil {
+		return 0, err
+	}
+	go func() {
+		r.peer.Write(EncodePacket(EvCmdComplete, h.Index, []byte{byte(h.Code), byte(h.Code >> 8), 0}))
+		r.peer.Close()
+	}()
+	<-(<-r.cl).Done()
+	return len(p), nil
+}
+
+func TestDoReplyBeforeClose(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		a, b := net.Pipe()
+		rw := &replyThenClose{Conn: a, peer: b, cl: make(chan *Client, 1)}
+		c := NewClient(rw, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		rw.cl <- c
+		if _, err := c.Do(0, OpSetPowered, u8(true)); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		c.Close()
+	}
+}
+
+func TestShutdownAfterFailedAlwaysPairableInit(t *testing.T) {
+	fake, conn := newFake(t)
+	fake.fail = map[uint16]bool{OpSetDiscoverable: true}
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(Config{Name: "Test", Store: st, AlwaysPairable: true,
+		Log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Open: func() (io.ReadWriteCloser, error) { return conn, nil }})
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "init failed", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return fake.count(OpSetDiscoverable) == 1 && !c.present && !c.initialising
+	})
+	fake.mu.Lock()
+	fake.fail = nil
+	fake.mu.Unlock()
+	c.Shutdown()
+	if p := fake.lastParams(OpSetDiscoverable); fake.count(OpSetDiscoverable) != 2 || len(p) != 3 || p[0] != 0 {
+		t.Fatalf("discoverable not cleared: %d commands, last %v", fake.count(OpSetDiscoverable), p)
+	}
+	if p := fake.lastParams(OpSetBondable); len(p) != 1 || p[0] != 0 {
+		t.Fatalf("bondable left %v", p)
+	}
+}

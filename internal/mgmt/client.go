@@ -227,13 +227,23 @@ func (c *Client) Do(index, opcode uint16, params []byte) ([]byte, error) {
 	}
 	t := time.NewTimer(CommandTimeout)
 	defer t.Stop()
-	select {
-	case r := <-p.ch:
+	result := func(r reply) ([]byte, error) {
 		if r.st != 0 {
 			return r.data, &StatusError{Op: opcode, Status: r.st}
 		}
 		return r.data, nil
+	}
+	select {
+	case r := <-p.ch:
+		return result(r)
 	case <-c.done:
+		// The reader may have delivered the reply just before ending: select
+		// picks a ready case at random, so prefer the reply.
+		select {
+		case r := <-p.ch:
+			return result(r)
+		default:
+		}
 		return nil, ErrClosed
 	case <-t.C:
 		c.clear(p)
