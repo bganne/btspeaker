@@ -457,3 +457,27 @@ func TestOpenNewDirIs0700(t *testing.T) {
 		t.Errorf("new dir: %v", fi.Mode().Perm())
 	}
 }
+
+func TestCheckWritable(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckWritable(); err != nil {
+		t.Fatal(err)
+	}
+	if es, _ := os.ReadDir(dir); len(es) != 0 {
+		t.Fatalf("probe left %v", es)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := s.CheckWritable(); err == nil {
+		t.Fatal("read-only dir reported writable")
+	}
+}

@@ -427,6 +427,27 @@ func (s *Store) lastSeenLocked() map[string]time.Time {
 	return m
 }
 
+// CheckWritable creates, renames and removes a temp file next to the state
+// file, as a save does. Open succeeds through a capability (e.g. root's
+// CAP_DAC_OVERRIDE on a directory owned by another uid) that later saves may
+// no longer have once capabilities are dropped; this catches it at startup.
+func (s *Store) CheckWritable() error {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	tmp, probe := s.path+".tmp", s.path+".probe"
+	os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	if err := os.Rename(tmp, probe); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Remove(probe)
+}
+
 // writeFile writes snapshot b of generation g unless a newer one is already
 // on disk (concurrent saves coalesce: only the newest snapshot matters).
 func (s *Store) writeFile(b []byte, g uint64, saved map[string]time.Time) error {
