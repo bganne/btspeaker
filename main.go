@@ -32,6 +32,7 @@ import (
 )
 
 type options struct {
+	envNames       map[string]bool // BTSPEAKER_* names that map to a flag
 	adapter        string
 	name           string
 	alsaDevice     string
@@ -85,6 +86,19 @@ func applyEnv(fs *flag.FlagSet, getenv func(string) (string, bool), set map[stri
 	return err
 }
 
+// unknownEnv returns the BTSPEAKER_* variables in environ ("NAME=value")
+// that match no flag: a typo would otherwise be silently ignored.
+func unknownEnv(known map[string]bool, environ []string) []string {
+	var out []string
+	for _, kv := range environ {
+		n, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(n, "BTSPEAKER_") && !known[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func parseOptions(args []string, getenv func(string) (string, bool)) (*options, error) {
 	var o options
 	fs := flag.NewFlagSet("btspeaker", flag.ContinueOnError)
@@ -115,6 +129,8 @@ func parseOptions(args []string, getenv func(string) (string, bool)) (*options, 
 		}
 		return nil, err
 	}
+	o.envNames = map[string]bool{"BTSPEAKER_PASSWORD": true}
+	fs.VisitAll(func(f *flag.Flag) { o.envNames[envName(f.Name)] = true })
 	explicit := map[string]bool{} // set on the command line or from the environment
 	if err := applyEnv(fs, getenv, explicit); err != nil {
 		return nil, err
@@ -185,6 +201,9 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "btspeaker:", err)
 		os.Exit(2) // the unit's RestartPreventExitStatus: a config error does not fix itself
+	}
+	for _, n := range unknownEnv(o.envNames, os.Environ()) {
+		slog.Warn("unknown environment variable ignored", "name", n)
 	}
 	if err := run(o); err != nil {
 		slog.Error("fatal", "err", err)
@@ -332,6 +351,10 @@ func run(o *options) error {
 	} else {
 		slog.Info("capabilities dropped")
 	}
+	if err := st.CheckWritable(); err != nil {
+		// Not fatal (playback still works), but pairings will not persist.
+		slog.Error("state directory not writable: link keys and names will not be saved", "dir", o.stateDir, "err", err)
+	}
 
 	<-ctx.Done()
 	stop() // restore default signal handling: a second Ctrl-C kills a hung shutdown
@@ -388,6 +411,13 @@ func parseAllow(list string) ([]netip.Prefix, error) {
 			if err != nil {
 				return nil, err
 			}
+			if p.Addr().Is4In6() {
+				// peerAllowed unmaps the peer, so match the IPv4 prefix.
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("%q: IPv4-mapped prefix shorter than /96", f)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			out = append(out, p.Masked())
 		default:
 			a, err := netip.ParseAddr(f)
@@ -397,6 +427,7 @@ func parseAllow(list string) ([]netip.Prefix, error) {
 			if a.Zone() != "" {
 				return nil, fmt.Errorf("%q: zones not supported", f)
 			}
+			a = a.Unmap() // peerAllowed unmaps the peer
 			out = append(out, netip.PrefixFrom(a, a.BitLen()))
 		}
 	}

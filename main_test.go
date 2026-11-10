@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +37,18 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if _, err := parseOptions([]string{"-volume", "loud"}, get); err == nil {
 		t.Fatal("want volume error")
+	}
+}
+
+func TestUnknownEnv(t *testing.T) {
+	o, err := parseOptions(nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := unknownEnv(o.envNames, []string{"BTSPEAKER_HTTP_PASSWORD=x", "BTSPEAKER_HTTP_PASSWD=x",
+		"BTSPEAKER_PASSWORD=x", "BTSPEAKER_ALSA_DEVICE=hw:1,0", "HOME=/root", "BTSPEAKER_X"})
+	if !slices.Equal(got, []string{"BTSPEAKER_HTTP_PASSWD", "BTSPEAKER_X"}) {
+		t.Fatalf("unknown %v", got)
 	}
 }
 
@@ -309,7 +323,7 @@ func TestDefaultNameUsedWhenUnset(t *testing.T) {
 }
 
 func TestParseAllow(t *testing.T) {
-	for _, bad := range []string{"", " , ", "10.0.0.0/33", "nope", "fe80::1%eth0"} {
+	for _, bad := range []string{"", " , ", "10.0.0.0/33", "nope", "fe80::1%eth0", "::ffff:0.0.0.0/95"} {
 		if _, err := parseAllow(bad); err == nil {
 			t.Errorf("parseAllow(%q) accepted", bad)
 		}
@@ -322,6 +336,10 @@ func TestParseAllow(t *testing.T) {
 		t.Fatal(err)
 	}
 	custom, err := parseAllow("203.0.113.7, 2001:db8::/32,10.1.2.3/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := parseAllow("::ffff:192.168.1.5,::ffff:10.0.0.0/104")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,6 +365,10 @@ func TestParseAllow(t *testing.T) {
 		{custom, "203.0.113.8:1", false},
 		{custom, "[2001:db8:1::1]:1", true},
 		{custom, "10.200.0.1:1", true},
+		{mapped, "192.168.1.5:1", true},
+		{mapped, "[::ffff:192.168.1.5]:1", true},
+		{mapped, "10.9.9.9:1", true},
+		{mapped, "192.168.1.6:1", false},
 	} {
 		if got := peerAllowed(c.allow, c.remote); got != c.want {
 			t.Errorf("peerAllowed(%v, %s) = %v", c.allow, c.remote, got)
@@ -379,5 +401,38 @@ func TestConnLimitListenerAllow(t *testing.T) {
 	}
 	if len(l.sem) != 1 { // only the pending Accept's reservation
 		t.Errorf("slots in use %d, want 1", len(l.sem))
+	}
+}
+
+// TestUnitAllowMatchesPrivateNets keeps the unit's IPAddressAllow and
+// -http-allow=private in sync: a peer one admits must not be dropped by the other.
+func TestUnitAllowMatchesPrivateNets(t *testing.T) {
+	b, err := os.ReadFile("deploy/btspeaker.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unit []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(l, "IPAddressAllow="); ok {
+			for _, f := range strings.Fields(v) {
+				switch f {
+				case "localhost":
+					unit = append(unit, "127.0.0.0/8", "::1/128")
+				case "link-local":
+					unit = append(unit, "169.254.0.0/16", "fe80::/10")
+				default:
+					unit = append(unit, netip.MustParsePrefix(f).Masked().String())
+				}
+			}
+		}
+	}
+	var priv []string
+	for _, p := range privateNets {
+		priv = append(priv, p.String())
+	}
+	slices.Sort(unit)
+	slices.Sort(priv)
+	if !slices.Equal(unit, priv) {
+		t.Fatalf("unit IPAddressAllow %v != privateNets %v", unit, priv)
 	}
 }
