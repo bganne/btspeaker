@@ -40,9 +40,14 @@ systemctl enable --now btspeaker
 journalctl -u btspeaker -f
 ```
 
-The unit runs as a dynamic user in the `audio` group with only `CAP_NET_ADMIN`, `CAP_NET_RAW`
-(the mgmt socket needs them for everything but reads) and `CAP_NET_BIND_SERVICE` (L2CAP PSMs
-below 0x1001: SDP, AVCTP, AVDTP). State (link keys, names) is in
+The unit runs as a dynamic user in the `audio` group with only `CAP_NET_ADMIN` (the mgmt
+socket is read-only without it) and `CAP_NET_BIND_SERVICE` (L2CAP PSMs below 0x1001: SDP,
+AVCTP, AVDTP). Both are only checked when the sockets are bound: once they are, btspeaker drops
+every capability of every thread (also when run as root; the uid is kept). If the mgmt socket
+is ever lost it exits (code 1) and systemd restarts it, since a socket reopened without
+`CAP_NET_ADMIN` would be useless. The cap drop needs a `CGO_ENABLED=0` build (`make build` /
+`make arm`); a cgo build logs `capabilities not dropped`. The unit also restricts IP traffic to
+loopback, link-local and private ranges (`IPAddressAllow`), like `-http-allow`'s default. State (link keys, names) is in
 `/var/lib/btspeaker/state.json`.
 
 ## Flags
@@ -63,6 +68,7 @@ below 0x1001: SDP, AVCTP, AVDTP). State (link keys, names) is in
 | `-state-dir` | `/var/lib/btspeaker` | |
 | `-listen` | `:8099` | web UI / API |
 | `-http-user`, `-http-password` | `admin`, none | basic auth on every route when a password is set; after repeated failures (burst 10, then 5/s) a client gets `429` |
+| `-http-allow` | `private` | peers allowed to connect: comma-separated CIDRs/IPs, `private` (loopback, RFC 1918, `100.64/10`, link-local, IPv6 ULA `fc00::/7`) or `any`; others are disconnected before any HTTP. Widening it also needs the unit's `IPAddressAllow` |
 | `-http-hosts` | `localhost`, hostname, its FQDN (the default `-name`), `hostname.local` | allowed `Host` names (IP literals always allowed; blocks DNS rebinding); other hosts get `421` |
 | `-list-devices`, `-test-tone` | | print ALSA playback devices / play a 2 s tone, then exit |
 
@@ -132,7 +138,10 @@ open of the device is delayed by it. That is fine for music but noticeable for v
 ## Troubleshooting
 
 - `bluetoothd is running`: `systemctl mask bluetooth.service` and stop it.
-- `permission denied` on the mgmt socket: run as root or with `CAP_NET_ADMIN CAP_NET_RAW`.
+- `permission denied` on the mgmt socket: run as root or with `CAP_NET_ADMIN`.
+- Web UI unreachable, log says `peer not in -http-allow`: the client's address is not private
+  (e.g. a global IPv6 address); add it or its prefix to `-http-allow` (and to the unit's
+  `IPAddressAllow`).
 - Adapter not found: `btmgmt info` (when bluez tools are installed) or check `dmesg` for `btusb`; the
   service keeps retrying and re-initializes if the adapter is re-plugged.
 - `power on: Failed` / `rfkill-blocked`: btspeaker lifts a soft rfkill block itself (and restores it

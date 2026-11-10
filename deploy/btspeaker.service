@@ -23,9 +23,11 @@ UMask=0077
 # netdev: /dev/rfkill is root:netdev 0664 (Debian ifupdown's udev rule); used to
 # lift a soft rfkill block on the adapter at start and restore it at stop.
 SupplementaryGroups=audio netdev
-# CAP_NET_BIND_SERVICE: L2CAP PSMs below 0x1001 (SDP 1, AVCTP 23, AVDTP 25) need it.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+# CAP_NET_ADMIN: trusted mgmt socket. CAP_NET_BIND_SERVICE: L2CAP PSMs below 0x1001
+# (SDP 1, AVCTP 23, AVDTP 25). Only needed to bind: btspeaker drops all capabilities
+# right after.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 # Single core shared with mpd: favour the audio path over mpd/web, but no RT scheduling
 # (a busy RT process would starve the kworkers running the BT/USB stack).
@@ -41,6 +43,10 @@ TasksMax=64
 # Hardening. PrivateDevices is deliberately not used: /dev/snd must stay visible.
 # AF_BLUETOOTH is required for the mgmt and L2CAP sockets.
 RestrictAddressFamilies=AF_BLUETOOTH AF_UNIX AF_INET AF_INET6
+# Web UI from the local network only (mirrors -http-allow=private, kernel-enforced).
+# Widen both together, e.g. IPAddressAllow=2001:db8:1::/48 plus BTSPEAKER_HTTP_ALLOW.
+IPAddressAllow=localhost link-local 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressDeny=any
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
